@@ -1,0 +1,33 @@
+{
+  "overall_minimum_line_percentage": 55.0,
+  "domains": {
+    "config": {
+      "minimum_line_percentage": 97.0,
+      "paths": ["src/config.rs", "src/compatibility/hocon.rs"]
+    },
+    "dispatch": {
+      "minimum_line_percentage": 31.0,
+      "paths": ["src/dispatch.rs", "src/runtime.rs", "src/runtime"]
+    },
+    "http": {"minimum_line_percentage": 8.0, "paths": ["src/http.rs"]},
+    "observability": {
+      "minimum_line_percentage": 64.0,
+      "paths": ["src/observability.rs", "src/errors.rs"]
+    },
+    "persistence": {
+      "minimum_line_percentage": 57.0,
+      "paths": [
+        "src/ingestion.rs", "src/ingestion", "src/load.rs", "src/load",
+        "src/archive.rs", "src/archive", "src/dq_runtime.rs", "src/dq_runtime"
+      ]
+    },
+    "postgres": {
+      "minimum_line_percentage": 29.0,
+      "paths": ["src/postgres.rs", "src/compatibility/tls_identity.rs"]
+    },
+    "processor": {
+      "minimum_line_percentage": 86.0,
+      "paths": ["src/processor.rs", "src/supervision.rs", "src/projections.rs", "src/projections"]
+    }
+  }
+}

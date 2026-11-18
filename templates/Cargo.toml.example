@@ -1,0 +1,21 @@
+# Activate only alongside a real, tested runtime implementation and Cargo.lock.
+[package]
+name = "octopus"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.100"
+publish = false
+
+# Keep this crate independent of the umbrella proxy workspace.
+[workspace]
+
+[[bin]]
+name = "octopus"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,18 @@
+/target/
+/artifacts/
+/coverage/
+__pycache__/
+*.py[cod]
+*.profraw
+*.profdata
+.env
+.env.*
+*.pem
+*.key
+secrets/
+.DS_Store
+.idea/
+.vscode/
+.omx/
+
+# Cargo.lock is intentionally tracked once a real runtime crate exists.

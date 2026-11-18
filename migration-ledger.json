@@ -1,0 +1,2105 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "parent_commit": "9a89488e872cded6b76735fb30750e0042609e31",
+    "octopus_commit": "6e94b74f219ab56a6c6104c4baa5bedf75fbce28"
+  },
+  "files": [
+    {
+      "source": ".github/CODEOWNERS",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": ".github/workflows/main-branch-source-policy.yml",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": ".gitignore",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": ".scalafix.conf",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": ".scalafmt.conf",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "AGENTS.md",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "Dockerfile",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "INGESTION-AUDIT.md",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "Jenkinsfile",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "README.md",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "build.sbt",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "coverage-policy.json",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "project/build.properties",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "project/metals.sbt",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "project/plugins.sbt",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "scripts/check_coverage.py",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "scripts/ci/cleanup.sh",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "scripts/ci/common.sh",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "scripts/ci/tasks/install-sbt.sh",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "scripts/ci/tasks/test-1.sh",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "scripts/ci/test.sh",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "setup-wireless-redpanda.sh",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/resources/application.conf",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/resources/logback.xml",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/resources/proxy-authority/public_suffix_list.dat",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/Main.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/archive/PayloadArchive.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/config/AppConfig.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/config/WirelessConfig.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/config/WirelessProjectionConfig.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/cron/CronScheduler.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/dispatch/BackpressureService.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/dispatch/BatchDispatchService.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/domain/BrokerRecordMetadata.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/domain/DatabaseError.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/domain/IngestionInvariantViolation.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/domain/RetryableDependencyException.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/domain/ScanRequestRecord.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/domain/SyncLoad.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/dq/DqApply.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/dq/DqArtifacts.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/dq/DqConfig.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/dq/DqMetrics.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/dq/DqModels.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/dq/DqRetention.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/dq/DqRuntime.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/dq/DqSnapshot.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/dq/DqStore.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/http/DqRoutes.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/http/HealthRoutes.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/http/LiveMetricsRoutes.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/http/PublicStatsRoutes.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/ingest/SyncEventHydrationService.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/kafka/BoundedBatching.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/kafka/DurableIngestion.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/kafka/KafkaComponents.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/kafka/KafkaDatabaseResult.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/kafka/LockedTopicConsumer.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/kafka/PostgresLoadStream.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/kafka/PostgresResultStream.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/kafka/ScanRequestStream.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/kafka/WirelessAuditStream.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/kafka/WirelessHeartbeatStream.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/observability/CoordinatorMetrics.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/observability/CoordinatorTracing.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/observability/OperationalStatsService.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/observability/StructuredLogger.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/persistence/BatchStatement.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/persistence/Stores.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/persistence/package.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/ArchiveCandidate.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/JsonFields.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/OutboxRecord.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresChecksum.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresClock.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresErrorClass.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresIngestionStore.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresLoad.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresLoadHandler.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresMaintenanceStore.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresOutboxStore.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresPayloadReadException.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresPayloadResolver.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresProcessorStateStore.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresProjectionStore.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresRepository.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresResult.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresResultStore.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresRows.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresSchemaPreflight.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresSink.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresSinkTarget.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresTls.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresTransactor.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresTransformService.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/PostgresWirelessStore.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/SchemaReadiness.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/StreamingPayloadRows.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/SyncEventHydrationCandidate.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/WirelessBacklogEntry.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/BatchSinkSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/DispatchAuthorizationSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/DqControlSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/DqMetricsSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/DqProjectionSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/DqRetentionSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/DqSnapshotSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/IdentityGraphSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/IngestionSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/IntelligenceSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/JobBatchSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/MaintenanceSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/OutboxSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/ProcessorStateSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/ProjectionSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/ProxyBehaviorSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/ProxyPreparationSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/ProxySignalSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/ResultSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/SearchPreparationSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/ThreatRiskSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/WirelessProcessorSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/WirelessProjectionSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/WirelessSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/postgres/sql/WirelessStreamSql.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/EventRetentionProcessor.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/FencedRetentionRunner.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/FencedWorkRunner.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/IntelligencePreparation.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/PayloadArchiver.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/Processor.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProcessorId.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProcessorSupervisor.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProjectionFunctions.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyAsnEnrichment.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyAuthority.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyBehavior.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyBehaviorCohorts.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyBehaviorScopes.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyBehaviorStatistics.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyClientHelloDrift.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyDestinationInfrastructure.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyDomainLexical.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyEvidence.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyIntelligencePolicy.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/ProxyThreatFeed.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/SearchDocumentPreparation.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/SearchRetentionProcessor.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/processor/WirelessObservation.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/util/ErrorSanitizer.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/util/PayloadJsonInspection.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/util/Sha256Utils.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/wiring/CoordinatorApplication.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/wiring/DatabaseModule.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/wiring/ObservabilityModule.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/wiring/RuntimeStreams.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/wiring/ServerModule.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/wiring/ServicesModule.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/wiring/workloads/ConsumerWorkloads.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/wiring/workloads/RetentionWorkloads.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/main/scala/com/sslproxy/coordinator/wiring/workloads/ScheduledWorkloads.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/resources/contracts/proxy-authority-v1.json",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/resources/contracts/proxy-events-v1.json",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/resources/features/embedding.feature",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/resources/features/maintenance.feature",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/resources/features/search-projection.feature",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/resources/features/sync.feature",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/resources/features/wireless.feature",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/resources/fixtures/wiretrap-event-completion-2026-10-16.json",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/resources/junit-platform.properties",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/DocumentationContractSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/FeatureContractSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/MainSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/ProcessorWorkloadWiringSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/archive/MinioPayloadArchiveSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/bdd/ProcessorContractSteps.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/bdd/RunCucumberTest.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/config/AppConfigSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/cron/CronSchedulerSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/dispatch/BackpressureServiceSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/domain/ScanRequestRecordSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/domain/SyncLoadSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/dq/DqContractSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/dq/DqRetentionSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/dq/DqRuntimeSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/dq/DqStoreIntegrationSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/http/HealthRoutesSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/http/LiveMetricsRoutesSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/http/PublicStatsRoutesSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/ingest/OctopusPersistenceIntegrationSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/ingest/SyncEventHydrationServiceSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/kafka/BoundedBatchingSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/kafka/DurableIngestionSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/kafka/LockedTopicConsumerSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/kafka/PostgresLoadStreamSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/kafka/PostgresResultStreamSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/kafka/ScanRequestStreamSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/kafka/WirelessAuditStreamSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/kafka/WirelessHeartbeatStreamSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/observability/CoordinatorMetricsSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/observability/CoordinatorTracingSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/observability/ObservabilityContractSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/observability/OperationalStatsServiceSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/observability/StructuredLoggerSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/observability/StructuredLoggerSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/persistence/BatchStatementSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/persistence/DbResultTSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/LiveHydrationProbeSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresChecksumSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresErrorClassSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresLoadHandlerSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresPayloadResolverSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresRepositoryRetrySuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresRepositorySimilaritySuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresRepositoryStableIdSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresResultSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresSinkRetrySuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresSinkTargetSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresSinkTimeoutIntegrationSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresTransactorSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/PostgresTransformServiceSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/StreamingPayloadRowsSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/BatchSinkSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/DownstreamCorrectnessIntegrationSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/IdentityGraphSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/IngestionPeaksIntegrationSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/IngestionSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/IntelligenceSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/JobBatchSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/MaintenanceSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/ProcessorStateSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/ProxyBehaviorSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/ResultSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/SearchPreparationSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/SqlPlacementSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/ThreatRiskSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/postgres/sql/WirelessSqlSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/FencedRetentionRunnerSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/IntelligencePreparationSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProcessorCatalogSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProcessorSupervisorSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProjectionFunctionsSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyAsnEnrichmentSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyAuthoritySuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyBehaviorCohortsSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyBehaviorScopeSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyBehaviorStatisticsSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyBehaviorSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyClientHelloDriftSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyDestinationInfrastructureSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyDomainLexicalSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyEvidenceSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyFlowContractSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyFollowOnIntegrationSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyIntelligenceEvidenceSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/ProxyThreatFeedSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/RetryPolicySuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/SearchDocumentPreparationSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/processor/WirelessObservationSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/util/ErrorSanitizerSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/util/PayloadJsonInspectionBenchmark.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    },
+    {
+      "source": "src/test/scala/com/sslproxy/coordinator/util/PayloadJsonInspectionSuite.scala",
+      "status": "pending",
+      "replacement_files": [],
+      "tests": [],
+      "verification": [],
+      "reason": ""
+    }
+  ]
+}

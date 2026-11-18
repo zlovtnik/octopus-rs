@@ -36,7 +36,7 @@ pub fn validate_digest(snapshot: &Value) -> Result<bool> {
     if let Some(o) = value.as_object_mut() {
         o.remove("source_revision_digest");
     }
-    Ok(dq::sha256(&value)? == digest)
+    Ok(crate::util::sha256_hex(dq::canonical(&value)?) == digest)
 }
 impl DqStore {
     pub async fn prepare_snapshot(&self, run: &Value, minimum_similarity: f64) -> Result<Value> {
@@ -86,7 +86,7 @@ impl DqStore {
         if let Some(candidate) = candidate {
             value["candidate_id"] = json!(candidate);
         }
-        let digest = dq::sha256(&value)?;
+        let digest = crate::util::sha256_hex(dq::canonical(&value)?);
         if dq::optional(parameters, "snapshot_revision")
             .is_some_and(|r| !r.is_empty() && r != digest)
         {

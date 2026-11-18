@@ -222,10 +222,15 @@ async fn ingest(
     let key = source.dedupe_key();
     let job_id = stable_uuid("job", &[stream, key]);
     let batch_id = stable_uuid("batch", &[stream, key]);
+    let event_kind = record
+        .inspection()
+        .event_kind
+        .as_deref()
+        .filter(|kind| utf16_length(kind) <= 64);
     if let Some(m) = metadata {
         if let Some(existing) = evidence(tx, m).await? {
             verify_evidence(record, &existing)?;
-            hydrate(tx, record).await?;
+            hydrate(tx, record, event_kind).await?;
             return persisted_decision(
                 tx,
                 stream,
@@ -258,11 +263,6 @@ async fn ingest(
         } else {
             "completed"
         };
-        let event_kind = record
-            .inspection()
-            .event_kind
-            .as_deref()
-            .filter(|kind| utf16_length(kind) <= 64);
         tx.execute("INSERT INTO sync_events (dedupe_key,stream_name,observed_at,payload_ref,payload,payload_sha256,status,attempt_count,last_error,producer,event_kind,created_at,updated_at) VALUES ($1,$2,CAST($3 AS text)::timestamptz,$4,CAST($5 AS text)::jsonb,$6,$7,1,NULL,'ssl-proxy',$8,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(dedupe_key,stream_name) DO UPDATE SET dedupe_key=sync_events.dedupe_key",
             &[&key,&stream,&source.observed_at(),&source.payload_ref(),&record.payload_json(),&record.event_payload_sha256(),&status,&event_kind]).await?;
         let stored_hash: Option<String> = tx.query("SELECT payload_sha256 FROM sync_events WHERE stream_name=$1 AND dedupe_key=$2 FOR UPDATE", &[&stream,&key]).await?[0].get(0);
@@ -274,7 +274,7 @@ async fn ingest(
                 "event identity changed payload hash after ingestion",
             ));
         }
-        hydrate(tx, record).await?;
+        hydrate(tx, record, event_kind).await?;
         if stream == "wireless.sensor.heartbeat" {
             upsert_heartbeat(tx, record).await?;
         }
@@ -359,10 +359,11 @@ async fn persisted_decision(
 async fn hydrate(
     tx: &mut PgTransaction,
     record: &ResolvedScanRequestRecord,
+    event_kind: Option<&str>,
 ) -> Result<(), IntakeError> {
     let source = record.source();
     let updated = tx.execute("UPDATE sync_events SET payload=CAST($1 AS text)::jsonb,payload_sha256=$2,event_kind=COALESCE($3,event_kind),updated_at=CURRENT_TIMESTAMP WHERE dedupe_key=$4 AND stream_name=$5 AND payload_archived=false AND (payload IS NULL OR payload_sha256=$2) AND NOT EXISTS(SELECT 1 FROM sync_event_tombstones tombstone WHERE tombstone.dedupe_key=sync_events.dedupe_key AND tombstone.stream_name=sync_events.stream_name AND tombstone.expires_at>CURRENT_TIMESTAMP)",
-        &[&record.payload_json(),&record.event_payload_sha256(),&record.inspection().event_kind,&source.dedupe_key(),&source.stream_name()]).await?;
+        &[&record.payload_json(),&record.event_payload_sha256(),&event_kind,&source.dedupe_key(),&source.stream_name()]).await?;
     if updated > 0 && source.stream_name() == "wireless.audit" {
         wireless::hydrate(tx, source.dedupe_key(), record.payload_json()).await?;
     }

@@ -219,6 +219,15 @@ func (c *Contract) Validate() error {
 		}
 	}
 
+	identity := c.Validation.IdentityCertificate
+	if strings.TrimSpace(identity.SecretName) == "" || strings.TrimSpace(identity.DNSName) == "" {
+		return fmt.Errorf("contract identityCertificate validation is incomplete")
+	}
+	loki := c.Validation.LokiHtpasswd
+	if strings.TrimSpace(loki.SecretName) == "" || strings.TrimSpace(loki.UsernameKey) == "" ||
+		strings.TrimSpace(loki.PasswordKey) == "" || strings.TrimSpace(loki.HtpasswdKey) == "" {
+		return fmt.Errorf("contract lokiHtpasswd validation is incomplete")
+	}
 	pg := c.Validation.Postgres
 	if pg.EndpointConfigMapName == "" || pg.Database == "" || pg.Transport == "" ||
 		pg.TLSSecretName == "" || pg.PgBouncerListenerTLSSecretName == "" ||

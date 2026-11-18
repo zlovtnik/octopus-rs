@@ -26,6 +26,9 @@ pub fn decode(bytes: &[u8], password: &str, kind: &str) -> Result<ClientIdentity
         return Err(IdentityError);
     }
     let identity = if kind.eq_ignore_ascii_case("PKCS12") {
+        if password.contains('\0') {
+            return Err(IdentityError);
+        }
         let material = openssl::pkcs12::Pkcs12::from_der(bytes)
             .and_then(|value| value.parse2(password))
             .map_err(|_| IdentityError)?;

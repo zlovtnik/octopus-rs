@@ -3,6 +3,7 @@ package log
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 
@@ -12,6 +13,7 @@ import (
 type Logger struct {
 	zl       zerolog.Logger
 	redacted map[string]bool
+	replacer *strings.Replacer
 	mu       sync.RWMutex
 }
 
@@ -48,20 +50,39 @@ func New() *Logger {
 	return &Logger{
 		zl:       zerolog.New(os.Stdout).Level(level).With().Timestamp().Logger(),
 		redacted: redacted,
+		replacer: newRedactor(redacted),
 	}
+}
+
+func newRedactor(redacted map[string]bool) *strings.Replacer {
+	names := make([]string, 0, len(redacted))
+	for name := range redacted {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
+	pairs := make([]string, 0, len(names)*2)
+	for _, name := range names {
+		pairs = append(pairs, name, "[REDACTED]")
+	}
+	return strings.NewReplacer(pairs...)
 }
 
 func (l *Logger) redact(msg string) string {
 	l.mu.RLock()
-	defer l.mu.RUnlock()
+	replacer := l.replacer
+	l.mu.RUnlock()
+	return replacer.Replace(msg)
+}
 
-	result := msg
-	for name := range l.redacted {
-		if strings.Contains(result, name) {
-			result = strings.ReplaceAll(result, name, "[REDACTED]")
+func (l *Logger) AddRedactedNames(names ...string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, name := range names {
+		if name != "" {
+			l.redacted[name] = true
 		}
 	}
-	return result
+	l.replacer = newRedactor(l.redacted)
 }
 
 func (l *Logger) Info(msg string, args ...interface{}) {

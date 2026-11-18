@@ -103,6 +103,14 @@ func TestValidatePgBouncerRequiresMatchingRuntimePasswords(t *testing.T) {
 	}
 }
 
+func TestPgBouncerUserlistQuotedFields(t *testing.T) {
+	fields := userlistLine.FindStringSubmatch(`"account" "pass word with ""quotes"""`)
+	if len(fields) != 3 || userlistField(fields[1]) != "account" ||
+		userlistField(fields[2]) != `pass word with "quotes"` {
+		t.Fatal("quoted username or password was decoded incorrectly")
+	}
+}
+
 func TestValidatePgBouncerListenerTLS(t *testing.T) {
 	c := postgresContract()
 	t.Run("accepts a valid listener certificate", func(t *testing.T) {

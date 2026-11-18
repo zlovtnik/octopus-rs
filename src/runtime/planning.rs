@@ -45,19 +45,14 @@ impl Planner {
             return Ok(0);
         }
         let mut tx = self.runtime.begin_worker().await?;
-        tx.query(
-            "SELECT count(*) FROM sync_events WHERE status IN ('pending','processing')",
-            &[],
-        )
-        .await?;
         let candidates=tx.query("SELECT e.stream_name,e.dedupe_key FROM sync_events e WHERE e.stream_name=ANY($1) AND e.status IN ('pending','failed') AND e.attempt_count<$2 AND (e.status='pending' OR e.updated_at<=CURRENT_TIMESTAMP-CAST($3 AS integer)*INTERVAL '1 second') ORDER BY e.observed_at,e.stream_name,e.dedupe_key LIMIT $4 FOR UPDATE",&[&self.streams,&self.cron.scan_max_attempts.max(1),&self.cron.scan_retry_backoff_seconds.max(1),&i64::from(self.cron.ingest_batch_size.max(1))]).await?;
         let mut processed = 0;
         for row in candidates {
             let stream: String = row.get(0);
             let key: String = row.get(1);
             tx.execute("INSERT INTO sync_jobs(job_id,stream_name,dedupe_key,status,attempt_count,created_at) SELECT gen_random_uuid(),e.stream_name,e.dedupe_key,'pending',0,CURRENT_TIMESTAMP FROM sync_events e WHERE e.stream_name=$1 AND e.dedupe_key=$2 ON CONFLICT(dedupe_key,stream_name) DO UPDATE SET job_id=sync_jobs.job_id",&[&stream,&key]).await?;
-            tx.execute("INSERT INTO sync_batches(batch_id,job_id,batch_no,payload_ref,status,row_count,attempt_count,dedupe_key,stream_name,cursor_start,cursor_end,created_at,updated_at) SELECT gen_random_uuid(),j.job_id,0,e.payload_ref,'pending',1,0,e.dedupe_key,e.stream_name,COALESCE(c.cursor_value,'0'),CASE WHEN e.stream_name='wireless.audit' THEN floor(extract(epoch FROM e.observed_at))::text ELSE e.dedupe_key END,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM sync_events e JOIN sync_jobs j ON j.stream_name=e.stream_name AND j.dedupe_key=e.dedupe_key LEFT JOIN sync_cursors c ON c.stream_name=e.stream_name WHERE e.stream_name=$1 AND e.dedupe_key=$2 ON CONFLICT(dedupe_key,stream_name) DO UPDATE SET batch_id=sync_batches.batch_id,updated_at=CURRENT_TIMESTAMP",&[&stream,&key]).await?;
-            processed+=tx.execute("UPDATE sync_events e SET status='batched',attempt_count=e.attempt_count+1,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE e.stream_name=$1 AND e.dedupe_key=$2 AND e.status IN ('pending','failed') AND EXISTS(SELECT 1 FROM sync_batches b WHERE b.stream_name=e.stream_name AND b.dedupe_key=e.dedupe_key AND b.status='pending' AND b.created_at>=e.updated_at)",&[&stream,&key]).await?;
+            let created = tx.execute("INSERT INTO sync_batches(batch_id,job_id,batch_no,payload_ref,status,row_count,attempt_count,dedupe_key,stream_name,cursor_start,cursor_end,created_at,updated_at) SELECT gen_random_uuid(),j.job_id,0,e.payload_ref,'pending',1,0,e.dedupe_key,e.stream_name,COALESCE(c.cursor_value,'0'),CASE WHEN e.stream_name='wireless.audit' THEN floor(extract(epoch FROM e.observed_at))::text ELSE e.dedupe_key END,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM sync_events e JOIN sync_jobs j ON j.stream_name=e.stream_name AND j.dedupe_key=e.dedupe_key LEFT JOIN sync_cursors c ON c.stream_name=e.stream_name WHERE e.stream_name=$1 AND e.dedupe_key=$2 ON CONFLICT(dedupe_key,stream_name) DO NOTHING",&[&stream,&key]).await?;
+            processed+=tx.execute("UPDATE sync_events e SET status='batched',attempt_count=e.attempt_count+1,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE e.stream_name=$1 AND e.dedupe_key=$2 AND e.status IN ('pending','failed') AND ($3 OR EXISTS(SELECT 1 FROM sync_batches b WHERE b.stream_name=e.stream_name AND b.dedupe_key=e.dedupe_key AND b.status='pending' AND b.created_at>=e.updated_at))",&[&stream,&key,&(created==1)]).await?;
         }
         tx.commit().await?;
         Ok(processed)

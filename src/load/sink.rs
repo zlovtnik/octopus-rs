@@ -26,7 +26,7 @@ pub(super) async fn insert_chunk(
             }
         }
         for r in sensors.values() {
-            tx.execute("INSERT INTO wireless_sensors(sensor_id,location_id,interface,reg_domain,first_seen_at,last_seen_at) SELECT r.sensor_id,r.location_id,r.interface,$2::text,r.observed_at,r.observed_at FROM jsonb_populate_record(NULL::wireless_audit_frames,$1) r ON CONFLICT(sensor_id) DO UPDATE SET location_id=EXCLUDED.location_id,interface=EXCLUDED.interface,reg_domain=EXCLUDED.reg_domain,last_seen_at=EXCLUDED.last_seen_at",&[r,&r["reg_domain"].as_str()]).await?;
+            tx.execute("INSERT INTO wireless_sensors(sensor_id,location_id,interface,reg_domain,first_seen_at,last_seen_at) SELECT r.sensor_id,r.location_id,r.interface,$2::text,r.observed_at,r.observed_at FROM jsonb_populate_record(NULL::wireless_audit_frames,$1) r ON CONFLICT(sensor_id) DO UPDATE SET location_id=EXCLUDED.location_id,interface=EXCLUDED.interface,reg_domain=EXCLUDED.reg_domain,last_seen_at=EXCLUDED.last_seen_at WHERE EXCLUDED.last_seen_at>=wireless_sensors.last_seen_at",&[r,&r["reg_domain"].as_str()]).await?;
         }
     }
     for row in rows {

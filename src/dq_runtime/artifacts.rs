@@ -92,11 +92,11 @@ impl DqArtifacts {
             .await
             .map_err(storage)
     }
-    pub async fn put_snapshot(&self, run: &Value, snapshot: &Value) -> Result<Value> {
-        let payload = dq::canonical(snapshot)?.into_bytes();
-        if payload.len() > self.config.max_artifact_bytes as usize {
-            return Err(error(400, "snapshot_size_exceeded"));
-        }
+    pub async fn put_snapshot(&self, run: &Value, snapshot: &Value, pinned_limit: usize) -> Result<Value> {
+        let limit = pinned_limit.min(self.config.max_artifact_bytes as usize);
+        let payload = dq::canonical_with_limit(snapshot, limit)
+            .map_err(|e| if e.code == "record_too_large" { error(400, "snapshot_size_exceeded") } else { e })?
+            .into_bytes();
         let hash = crate::util::sha256_hex(&payload);
         let installation = dq::text(run, "installation_id")?;
         let namespace = dq::text(run, "namespace")?;
@@ -118,14 +118,15 @@ impl DqArtifacts {
             .filter(|v| !v.is_empty() && v != "null")
             .ok_or_else(|| error(400, "artifact_version_missing"))?;
         let reference = json!({"artifact_id":dq::sha256(&json!([run_id,hash]))?,"producer_run_id":run_id,"installation_id":installation,"namespace":namespace,"uri":format!("s3://{}/{}",self.config.artifact_bucket,key),"version_id":version,"etag":stored.etag,"sha256":hash,"schema_id":"atheros.dedup.snapshot.v1","media_type":"application/json","size_bytes":payload.len()});
-        self.read(&reference, run, false).await?;
+        self.read(&reference, run, false, pinned_limit).await?;
         Ok(reference)
     }
-    pub async fn read(&self, reference: &Value, run: &Value, output: bool) -> Result<Value> {
+    pub async fn read(&self, reference: &Value, run: &Value, output: bool, pinned_limit: usize) -> Result<Value> {
         let key = object_key(reference, run, output, &self.config)?;
         let version = dq::text(reference, "version_id")?;
         let size = dq::long(reference, "size_bytes")?;
-        if size < 0 || size > i64::from(self.config.max_artifact_bytes) {
+        let limit = pinned_limit.min(self.config.max_artifact_bytes as usize);
+        if usize::try_from(size).map_or(true, |size| size > limit) {
             return Err(error(400, "artifact_size_exceeded"));
         }
         let stat = self
@@ -139,7 +140,7 @@ impl DqArtifacts {
         }
         let bytes = self
             .objects
-            .get_versioned(&key, Some(version), self.config.max_artifact_bytes as usize)
+            .get_versioned(&key, Some(version), limit)
             .await
             .map_err(storage)?;
         if bytes.len() as i64 != size
@@ -162,7 +163,7 @@ impl DqArtifacts {
         let version = dq::text(reference, "version_id")?;
         if !uri.starts_with(&scoped_prefix)
             || !key.split('/').all(safe_segment)
-            || version == "null"
+            || version.is_empty() || version == "null"
         {
             return Err(error(400, "forbidden_artifact_reference"));
         }

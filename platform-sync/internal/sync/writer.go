@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 )
 
 const fieldManager = "platform-sync"
+const writeIDAnnotation = "platform-sync/write-id"
 
 var readinessKeys = []string{"ready", "contract-sha256", "last-success-unix"}
 
@@ -56,8 +58,17 @@ func writeAllWithClient(ctx context.Context, logger *log.Logger, client objectCl
 	if err != nil {
 		return 0, fmt.Errorf("acquire lock: %w", err)
 	}
+	cleanup := context.WithoutCancel(ctx)
 	if lock != nil {
-		defer releaseLock(ctx, logger, client, lock)
+		// Reserve part of the lease for rollback and release, with margin for clock skew.
+		ttl := time.Duration(lockTTL) * time.Second
+		cleanupCtx, cancelCleanup := context.WithDeadline(cleanup, lock.expiresAt.Add(-ttl/10))
+		defer cancelCleanup()
+		cleanup = cleanupCtx
+		defer releaseLock(cleanup, logger, client, lock)
+		writeCtx, cancelWrites := context.WithDeadline(ctx, lock.expiresAt.Add(-ttl/3))
+		defer cancelWrites()
+		ctx = writeCtx
 	}
 
 	inputs := append(append([]contract.Input{}, c.Inputs...), contract.Input{
@@ -70,6 +81,15 @@ func writeAllWithClient(ctx context.Context, logger *log.Logger, client objectCl
 	changed := make([]bool, len(c.Inputs))
 	for i := range c.Inputs {
 		changed[i] = objectDataChanged(previous[i], desired[i])
+	}
+	writeID := rand.Text()
+	for _, obj := range desired {
+		annotations := obj.GetAnnotations()
+		if annotations == nil {
+			annotations = make(map[string]string)
+		}
+		annotations[writeIDAnnotation] = writeID
+		obj.SetAnnotations(annotations)
 	}
 
 	for i, input := range inputs {
@@ -90,16 +110,55 @@ func writeAllWithClient(ctx context.Context, logger *log.Logger, client objectCl
 	}
 
 	applied := make([]int, 0, len(desired))
-	for i, input := range c.Inputs {
-		updated, updateErr := client.Update(ctx, resourceForKind(input.Kind), c.Namespace, desired[i], metav1.UpdateOptions{
-			FieldManager: fieldManager,
-		})
-		if updateErr != nil {
-			rollbackErr := rollbackObjects(ctx, logger, client, c.Namespace, inputs, previous, applied)
-			return 0, errors.Join(fmt.Errorf("write %s/%s: %w", input.Kind, input.Name, updateErr), rollbackErr)
+	appliedVersions := make([]string, len(desired))
+	rollback := func() error {
+		return rollbackObjects(cleanup, logger, client, c.Namespace, inputs, previous, applied, appliedVersions)
+	}
+	apply := func(i int, obj *unstructured.Unstructured) error {
+		input := inputs[i]
+		resource := resourceForKind(input.Kind)
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		desired[i] = updated
-		applied = append(applied, i)
+		updated, err := client.Update(ctx, resource, c.Namespace, obj, metav1.UpdateOptions{FieldManager: fieldManager})
+		if err == nil {
+			applied = append(applied, i)
+			appliedVersions[i] = updated.GetResourceVersion()
+			return nil
+		}
+		current, readErr := client.Get(cleanup, resource, c.Namespace, input.Name, metav1.GetOptions{})
+		if readErr != nil {
+			return errors.Join(err, fmt.Errorf("confirm write outcome: %w", readErr))
+		}
+		if current.GetUID() == obj.GetUID() && current.GetAnnotations()[writeIDAnnotation] == writeID &&
+			!objectDataChanged(current, obj) && current.Object["type"] == obj.Object["type"] {
+			// The response was lost. Restore the fields this write owned while
+			// preserving unrelated metadata observed by the confirming read.
+			restore := current.DeepCopy()
+			for _, key := range []string{"data", "type"} {
+				if value, ok := previous[i].Object[key]; ok {
+					restore.Object[key] = value
+				} else {
+					delete(restore.Object, key)
+				}
+			}
+			annotations := restore.GetAnnotations()
+			if old, ok := previous[i].GetAnnotations()[writeIDAnnotation]; ok {
+				annotations[writeIDAnnotation] = old
+			} else {
+				delete(annotations, writeIDAnnotation)
+			}
+			restore.SetAnnotations(annotations)
+			previous[i] = restore
+			applied = append(applied, i)
+			appliedVersions[i] = current.GetResourceVersion()
+		}
+		return err
+	}
+	for i, input := range c.Inputs {
+		if err := apply(i, desired[i]); err != nil {
+			return 0, errors.Join(fmt.Errorf("write %s/%s: %w", input.Kind, input.Name, err), rollback())
+		}
 		logger.Info(
 			"wrote object",
 			"kind", input.Kind,
@@ -113,15 +172,11 @@ func writeAllWithClient(ctx context.Context, logger *log.Logger, client objectCl
 	readinessInput := inputs[readinessIndex]
 	readiness, err := readinessObject(desired[readinessIndex], readinessInput, c.SHA256)
 	if err != nil {
-		rollbackErr := rollbackObjects(ctx, logger, client, c.Namespace, inputs, previous, applied)
-		return 0, errors.Join(err, rollbackErr)
+		return 0, errors.Join(err, rollback())
 	}
-	updated, updateErr := client.Update(ctx, configMapResource, c.Namespace, readiness, metav1.UpdateOptions{FieldManager: fieldManager})
-	if updateErr != nil {
-		rollbackErr := rollbackObjects(ctx, logger, client, c.Namespace, inputs, previous, applied)
-		return 0, errors.Join(fmt.Errorf("write ConfigMap/%s: %w", readinessInput.Name, updateErr), rollbackErr)
+	if err := apply(readinessIndex, readiness); err != nil {
+		return 0, errors.Join(fmt.Errorf("write ConfigMap/%s: %w", readinessInput.Name, err), rollback())
 	}
-	desired[readinessIndex] = updated
 	logger.Info("wrote object", "kind", readinessInput.Kind, "name", readinessInput.Name, "changed", true)
 
 	changedCount := 0
@@ -215,19 +270,14 @@ func desiredObject(current *unstructured.Unstructured, input contract.Input, val
 	return obj, nil
 }
 
-func rollbackObjects(ctx context.Context, logger *log.Logger, client objectClient, namespace string, inputs []contract.Input, previous []*unstructured.Unstructured, applied []int) error {
+func rollbackObjects(ctx context.Context, logger *log.Logger, client objectClient, namespace string, inputs []contract.Input, previous []*unstructured.Unstructured, applied []int, appliedVersions []string) error {
 	var rollbackErrors []error
 	for n := len(applied) - 1; n >= 0; n-- {
 		i := applied[n]
 		input := inputs[i]
 		resource := resourceForKind(input.Kind)
-		current, err := client.Get(ctx, resource, namespace, input.Name, metav1.GetOptions{})
-		if err != nil {
-			rollbackErrors = append(rollbackErrors, fmt.Errorf("read %s/%s for rollback: %w", input.Kind, input.Name, err))
-			continue
-		}
 		restore := previous[i].DeepCopy()
-		restore.SetResourceVersion(current.GetResourceVersion())
+		restore.SetResourceVersion(appliedVersions[i])
 		if _, err := client.Update(ctx, resource, namespace, restore, metav1.UpdateOptions{FieldManager: fieldManager}); err != nil {
 			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore %s/%s: %w", input.Kind, input.Name, err))
 			continue

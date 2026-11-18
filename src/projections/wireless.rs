@@ -67,10 +67,16 @@ impl WirelessObservation {
         let observed_at = string(v, "observed_at", "")
             .and_then(|s| s.parse::<DateTime<Utc>>().ok())
             .ok_or(ProjectionError::Invalid("observed_at"))?;
-        if integer(v, "schema_version", "").is_some_and(|version| !(1..=2).contains(&version)) {
+        if field(v, "schema_version", "").is_some()
+            && !matches!(integer(v, "schema_version", ""), Some(1 | 2))
+        {
             return Err(ProjectionError::Invalid(
                 "unsupported wireless schema version",
             ));
+        }
+        let ssid = string(v, "ssid", "");
+        if ssid.as_deref().is_some_and(|value| value.contains('\0')) {
+            return Err(ProjectionError::Invalid("ssid contains a NUL character"));
         }
         Ok(Self {
             sensor_id,
@@ -78,7 +84,7 @@ impl WirelessObservation {
             source_mac: mac(v, "source_mac"),
             bssid: mac(v, "bssid"),
             transmitter_mac: mac(v, "transmitter_mac"),
-            ssid: string(v, "ssid", "").filter(|s| utf16_length(s) <= 256),
+            ssid: ssid.filter(|s| utf16_length(s) <= 256),
             signal_dbm: integer(v, "signal_dbm", "rf").filter(|v| (-127..0).contains(v)),
             frequency_mhz: integer(v, "frequency_mhz", "rf"),
             channel: integer(v, "channel_number", "rf").or_else(|| integer(v, "channel", "")),
@@ -199,7 +205,7 @@ pub async fn project(
         .map_err(|_| ProjectionError::Invalid("calibrations"))?;
     let mut current = calibrations
         .iter()
-        .filter(|c| c.sensor_id == event.sensor_id && now >= c.valid_from && now <= c.valid_until);
+        .filter(|c| c.sensor_id == event.sensor_id && now >= c.valid_from && now < c.valid_until);
     let first = current.next();
     let calibration = if current.next().is_none() {
         first
@@ -250,7 +256,7 @@ async fn edge(
     observed: DateTime<Utc>,
     expires: Option<DateTime<Utc>>,
 ) -> Result<(), ProjectionError> {
-    tx.execute("INSERT INTO atheros_search.wireless_topology_edges (edge_id,source_node_id,target_node_id,edge_kind,label,evidence,observed_at,projection_run_id,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'wireless-stream-v1',$8) ON CONFLICT(edge_id) DO UPDATE SET evidence=EXCLUDED.evidence,observed_at=EXCLUDED.observed_at,expires_at=EXCLUDED.expires_at,updated_at=CURRENT_TIMESTAMP", &[&id,&source,&target,&kind,&label,&evidence,&observed,&expires]).await?;
+    tx.execute("INSERT INTO atheros_search.wireless_topology_edges (edge_id,source_node_id,target_node_id,edge_kind,label,evidence,observed_at,projection_run_id,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'wireless-stream-v1',$8) ON CONFLICT(edge_id) DO UPDATE SET evidence=EXCLUDED.evidence,observed_at=EXCLUDED.observed_at,expires_at=EXCLUDED.expires_at,updated_at=CURRENT_TIMESTAMP WHERE wireless_topology_edges.observed_at IS NULL OR EXCLUDED.observed_at>=wireless_topology_edges.observed_at", &[&id,&source,&target,&kind,&label,&evidence,&observed,&expires]).await?;
     Ok(())
 }
 async fn update_projection(
@@ -539,7 +545,8 @@ pub async fn delete_document(tx: &mut PgTransaction, id: &str) -> Result<(), Pro
     Ok(())
 }
 pub async fn expire(tx: &mut PgTransaction, limit: i32) -> Result<i32, ProjectionError> {
-    let ids=tx.query("SELECT summary_id::text FROM atheros_search.wireless_observation_summaries WHERE expires_at<=CURRENT_TIMESTAMP ORDER BY expires_at,summary_id LIMIT $1 FOR UPDATE SKIP LOCKED", &[&limit.max(1)]).await?;
+    let limit = i64::from(limit.max(1));
+    let ids=tx.query("SELECT summary_id::text FROM atheros_search.wireless_observation_summaries WHERE expires_at<=CURRENT_TIMESTAMP ORDER BY expires_at,summary_id LIMIT $1 FOR UPDATE SKIP LOCKED", &[&limit]).await?;
     for row in &ids {
         let id: String = row.get(0);
         let documents=tx.query("SELECT document_id FROM atheros_search.search_documents WHERE source_kind='observation_window' AND source_key=$1 FOR UPDATE", &[&id]).await?;
@@ -553,6 +560,7 @@ pub async fn expire(tx: &mut PgTransaction, limit: i32) -> Result<i32, Projectio
         .await?;
         tx.execute("DELETE FROM atheros_search.wireless_observation_summaries WHERE summary_id=$1::text::uuid", &[&id]).await?;
     }
+    let mut remaining = limit;
     for (table, columns) in [
         (
             "wireless_projection_group_receipts",
@@ -564,9 +572,11 @@ pub async fn expire(tx: &mut PgTransaction, limit: i32) -> Result<i32, Projectio
         ),
         ("wireless_projection_hashes", "payload_sha256"),
     ] {
-        loop {
-            let deleted=tx.execute(&format!("DELETE FROM octopus_core.{table} WHERE ({columns}) IN(SELECT {columns} FROM octopus_core.{table} WHERE expires_at<=CURRENT_TIMESTAMP ORDER BY expires_at,{columns} LIMIT 5000 FOR UPDATE SKIP LOCKED)"), &[]).await?;
-            if deleted < 5000 {
+        while remaining > 0 {
+            let batch = remaining.min(5000);
+            let deleted=tx.execute(&format!("DELETE FROM octopus_core.{table} WHERE ({columns}) IN(SELECT {columns} FROM octopus_core.{table} WHERE expires_at<=CURRENT_TIMESTAMP ORDER BY expires_at,{columns} LIMIT $1 FOR UPDATE SKIP LOCKED)"), &[&batch]).await?;
+            remaining -= deleted as i64;
+            if deleted < batch as u64 {
                 break;
             }
         }

@@ -50,12 +50,15 @@ impl RetentionStore {
             days,
             lease_ttl_seconds,
             stop,
-            move |lease| {
+            move |lease, progress| {
                 Box::pin(async move {
-                    let archived = archiver.archive_once().await?;
+                    let archived = archiver.archive_candidates(Some(&lease), || {
+                        progress.lock().unwrap_or_else(|error| error.into_inner()).archived += 1;
+                    }).await?;
                     let mut counts = store.retain_events(&config, &lease).await?;
                     counts.archived = archived as i64;
-                    store.prune_tombstones(config.batch_size).await?;
+                    *progress.lock().unwrap_or_else(|error| error.into_inner()) = counts;
+                    store.prune_tombstones_fenced(config.batch_size, Some(&lease)).await?;
                     Ok(counts)
                 })
             },
@@ -80,7 +83,7 @@ impl RetentionStore {
             days,
             lease_ttl_seconds,
             stop,
-            move |lease| Box::pin(async move { store.retain_search(&config, &lease).await }),
+            move |lease, _| Box::pin(async move { store.retain_search(&config, &lease).await }),
         )
         .await
     }
@@ -95,7 +98,7 @@ impl RetentionStore {
         days: i32,
         ttl: i32,
         stop: CancellationToken,
-        operation: impl FnOnce(Lease) -> BoxFuture<'static, Result<RetentionCounts, ArchiveError>>,
+        operation: impl FnOnce(Lease, Arc<std::sync::Mutex<RetentionCounts>>) -> BoxFuture<'static, Result<RetentionCounts, ArchiveError>>,
     ) -> Result<Option<RetentionCounts>, ArchiveError> {
         if stop.is_cancelled() {
             return Err(ArchiveError::Cancelled);
@@ -108,6 +111,7 @@ impl RetentionStore {
             return Ok(None);
         };
         let run = uuid::Uuid::new_v4().to_string();
+        let progress = Arc::new(std::sync::Mutex::new(RetentionCounts::default()));
         let cutoff = Utc::now() - ChronoDuration::days(i64::from(days.max(1)));
         let result=async {
             let mut tx=self.runtime.begin_worker().await?;
@@ -116,25 +120,26 @@ impl RetentionStore {
             if inserted!=1 {return Err(ArchiveError::CandidateChanged);}
             tx.commit().await?;
             let renew=async {loop {
-                tokio::time::sleep(Duration::from_secs((ttl.max(1) as u64/3).max(1))).await;
+                tokio::time::sleep(Duration::from_secs(ttl.max(1) as u64)/3).await;
                 if !self.leases.renew("maintenance",resource_id,&lease,ttl).await? {return Err(ArchiveError::LeaseLost);}
             }};
             tokio::select! {biased;
                 _=stop.cancelled()=>Err(ArchiveError::Cancelled),
-                result=operation(lease.clone())=>result,
+                result=operation(lease.clone(), progress.clone())=>result,
                 result=renew=>result,
             }
         }.await;
+        let committed = *progress.lock().unwrap_or_else(|error| error.into_inner());
         let (status, counts, error) = match &result {
             Ok(counts) => ("completed", *counts, None),
             Err(ArchiveError::Cancelled) => (
                 "cancelled",
-                RetentionCounts::default(),
+                committed,
                 Some("retention processor cancelled".to_owned()),
             ),
             Err(error) => (
                 "failed",
-                RetentionCounts::default(),
+                committed,
                 Some(crate::errors::sanitize(&error.to_string())),
             ),
         };
@@ -239,9 +244,16 @@ impl RetentionStore {
     }
 
     pub async fn prune_tombstones(&self, limit: i32) -> Result<u64, ArchiveError> {
+        self.prune_tombstones_fenced(limit, None).await
+    }
+
+    async fn prune_tombstones_fenced(&self, limit: i32, lease: Option<&MaintenanceLease>) -> Result<u64, ArchiveError> {
         let mut tx = self.runtime.begin_worker().await?;
+        if let Some(lease) = lease {
+            guard(&mut tx, "event-retention", lease).await?;
+        }
         let limit = i64::from(limit.max(1));
-        let count=tx.execute("DELETE FROM sync_event_tombstones WHERE (dedupe_key,stream_name) IN (SELECT dedupe_key,stream_name FROM sync_event_tombstones WHERE expires_at<CURRENT_TIMESTAMP ORDER BY expires_at,stream_name,dedupe_key LIMIT $1)",&[&limit]).await?;
+        let count=tx.execute("DELETE FROM sync_event_tombstones WHERE expires_at<clock_timestamp() AND (dedupe_key,stream_name) IN (SELECT dedupe_key,stream_name FROM sync_event_tombstones WHERE expires_at<CURRENT_TIMESTAMP ORDER BY expires_at,stream_name,dedupe_key LIMIT $1 FOR UPDATE SKIP LOCKED)",&[&limit]).await?;
         tx.commit().await?;
         Ok(count)
     }
@@ -258,7 +270,7 @@ impl RetentionStore {
     }
 }
 
-async fn guard(
+pub(super) async fn guard(
     tx: &mut PgTransaction,
     resource_id: &str,
     lease: &MaintenanceLease,

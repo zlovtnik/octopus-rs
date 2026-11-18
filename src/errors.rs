@@ -4,17 +4,18 @@ use regex::{Captures, Regex};
 use std::{error::Error, sync::LazyLock};
 
 static CONTROLS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\p{Cc}\p{Cf}]").unwrap());
-static USERINFO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"://[^/]*?:([^@/]+)@").unwrap());
+static USERINFO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"://[^/?#\s]+@").unwrap());
 static BEARER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)((?:authorization[ \t\n\x0B\f\r]*[:=]?[ \t\n\x0B\f\r]*)?Bearer[ \t\n\x0B\f\r]+)([A-Za-z0-9._\-]+)").unwrap()
+    Regex::new(r"(?i)((?:authorization[ \t\n\x0B\f\r]*[:=]?[ \t\n\x0B\f\r]*)?Bearer[ \t\n\x0B\f\r]+)([A-Za-z0-9._~+/\-]+=*)").unwrap()
 });
 static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(password|passwd|token|secret|api[-_]?key)[ \t\n\x0B\f\r]*[:=][ \t\n\x0B\f\r]*([^ \t\n\x0B\f\r,;]+)").unwrap()
+    Regex::new(r#"(?i)(password|passwd|token|secret|api[-_]?key)[ \t\n\x0B\f\r]*[:=][ \t\n\x0B\f\r]*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^ \t\n\x0B\f\r,;]+)"#).unwrap()
 });
 static WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t\n\x0B\f\r]+").unwrap());
 
 pub fn sanitize(value: &str) -> String {
-    let controls = CONTROLS.replace_all(value, "");
+    let separated = WHITESPACE.replace_all(value, " ");
+    let controls = CONTROLS.replace_all(&separated, "");
     let userinfo = USERINFO.replace_all(&controls, "://[REDACTED]@");
     let bearer = BEARER.replace_all(&userinfo, |c: &Captures<'_>| format!("{}[REDACTED]", &c[1]));
     let assigned =

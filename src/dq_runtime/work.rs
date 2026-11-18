@@ -80,7 +80,7 @@ impl DqStore {
     ) -> Result<bool> {
         self.lock_run(tx, run).await?;
         let r = self.run_tx(tx, run).await?;
-        let valid:bool=tx.query("SELECT EXISTS(SELECT 1 FROM octopus_core.dq_runs r JOIN octopus_core.dq_attempts a ON a.attempt_id=r.current_attempt_id WHERE r.run_id=$1 AND r.status='applying' AND r.work_owner=$4 AND r.work_expires_at>CURRENT_TIMESTAMP AND r.deadline_at>CURRENT_TIMESTAMP AND r.source_revision_digest=$5 AND a.attempt_id=$2 AND a.fence=$3 AND r.fence=$3 AND a.status='applying')",&[&run,&attempt,&fence,&owner,&revision]).await.map_err(database)?[0].get(0);
+        let valid:bool=tx.query("WITH sampled AS MATERIALIZED (SELECT clock_timestamp() AS now) SELECT EXISTS(SELECT 1 FROM octopus_core.dq_runs r JOIN octopus_core.dq_attempts a ON a.attempt_id=r.current_attempt_id CROSS JOIN sampled WHERE r.run_id=$1 AND r.status='applying' AND r.work_owner=$4 AND r.work_expires_at>sampled.now AND r.deadline_at>sampled.now AND r.source_revision_digest=$5 AND a.attempt_id=$2 AND a.fence=$3 AND r.fence=$3 AND a.status='applying')",&[&run,&attempt,&fence,&owner,&revision]).await.map_err(database)?[0].get(0);
         Ok(valid && self.current_policy(tx, &r).await?)
     }
     #[allow(clippy::too_many_arguments)]
@@ -112,7 +112,7 @@ impl DqStore {
         if dq::text(&r, "status")? == "failed" {
             self.event(tx, run, "failed", "dq.events.v1").await?;
             self.event(tx, run, "failed", "dq.dlq.v1").await?;
-        } else if r["input_refs"].as_array().is_some_and(|a| !a.is_empty()) {
+        } else if r["status"] == "retrying" && r["input_refs"].as_array().is_some_and(|a| !a.is_empty()) {
             self.event(tx, run, "retry_dispatch", "dq.commands.v1")
                 .await?;
         }
@@ -142,7 +142,7 @@ impl DqStore {
         for row in rows {
             let run: String = row.get(0);
             self.lock_run(&mut tx, &run).await?;
-            let changed=tx.execute("UPDATE octopus_core.dq_runs SET status=CASE WHEN attempt_count>=5 OR preparation_attempts>=5 OR application_attempts>=5 OR deadline_at<=CURRENT_TIMESTAMP THEN 'failed' ELSE 'retrying' END,fence=fence+1,state_revision=state_revision+1,current_attempt_id=NULL,work_owner=NULL,work_expires_at=NULL,error_code='lease_expired',output_refs='[]'::jsonb,completed_at=CASE WHEN attempt_count>=5 OR preparation_attempts>=5 OR application_attempts>=5 OR deadline_at<=CURRENT_TIMESTAMP THEN CURRENT_TIMESTAMP ELSE NULL END,next_attempt_at=CURRENT_TIMESTAMP+(random()*LEAST(60,POWER(2,attempt_count-1)))*INTERVAL '1 second' WHERE run_id=$1 AND status NOT IN ('succeeded','failed','cancelled') AND(deadline_at<=CURRENT_TIMESTAMP OR(work_expires_at<=CURRENT_TIMESTAMP AND((status='applying' AND application_attempts>=5) OR(status='preparing' AND preparation_attempts>=5))) OR EXISTS(SELECT 1 FROM octopus_core.dq_attempts a WHERE a.attempt_id=current_attempt_id AND a.status IN ('reserved','accepted','running') AND a.lease_expires_at<=CURRENT_TIMESTAMP))",&[&run]).await.map_err(database)?;
+            let changed=tx.execute("WITH sampled AS MATERIALIZED (SELECT clock_timestamp() AS now) UPDATE octopus_core.dq_runs SET status=CASE WHEN deadline_at<=sampled.now OR CASE WHEN status='applying' THEN work_expires_at<=sampled.now AND application_attempts>=5 WHEN status='preparing' THEN work_expires_at<=sampled.now AND preparation_attempts>=5 ELSE attempt_count>=5 AND EXISTS(SELECT 1 FROM octopus_core.dq_attempts a WHERE a.attempt_id=current_attempt_id AND a.status IN ('reserved','accepted','running') AND a.lease_expires_at<=sampled.now) END THEN 'failed' ELSE 'retrying' END,fence=fence+1,state_revision=state_revision+1,current_attempt_id=NULL,work_owner=NULL,work_expires_at=NULL,error_code='lease_expired',output_refs='[]'::jsonb,completed_at=CASE WHEN deadline_at<=sampled.now OR CASE WHEN status='applying' THEN work_expires_at<=sampled.now AND application_attempts>=5 WHEN status='preparing' THEN work_expires_at<=sampled.now AND preparation_attempts>=5 ELSE attempt_count>=5 AND EXISTS(SELECT 1 FROM octopus_core.dq_attempts a WHERE a.attempt_id=current_attempt_id AND a.status IN ('reserved','accepted','running') AND a.lease_expires_at<=sampled.now) END THEN sampled.now ELSE NULL END,next_attempt_at=sampled.now+(random()*LEAST(60,POWER(2,attempt_count-1)))*INTERVAL '1 second' FROM sampled WHERE run_id=$1 AND status NOT IN ('succeeded','failed','cancelled') AND(deadline_at<=sampled.now OR(work_expires_at<=sampled.now AND((status='applying' AND application_attempts>=5) OR(status='preparing' AND preparation_attempts>=5))) OR EXISTS(SELECT 1 FROM octopus_core.dq_attempts a WHERE a.attempt_id=current_attempt_id AND a.status IN ('reserved','accepted','running') AND a.lease_expires_at<=sampled.now))",&[&run]).await.map_err(database)?;
             if changed == 1 {
                 tx.execute("UPDATE octopus_core.dq_attempts SET status='expired',finished_at=CURRENT_TIMESTAMP WHERE run_id=$1 AND status IN ('reserved','accepted','running','applying')",&[&run]).await.map_err(database)?;
                 self.terminal_or_retry(&mut tx, &run).await?;
@@ -160,7 +160,7 @@ impl DqStore {
     ) -> Result<Vec<DqOutbox>> {
         let token = id();
         let mut tx = self.transaction().await?;
-        let rows=tx.query("WITH selected AS(SELECT outbox_id FROM octopus_core.dq_outbox WHERE(status='pending' AND next_attempt_at<=CURRENT_TIMESTAMP) OR(status='leased' AND lease_expires_at<=CURRENT_TIMESTAMP) ORDER BY created_at,outbox_id FOR UPDATE SKIP LOCKED LIMIT $4::int) UPDATE octopus_core.dq_outbox o SET status='leased',owner=$1,token=$2,fence=fence+1,lease_expires_at=CURRENT_TIMESTAMP+$3::int*INTERVAL '1 second',attempt_count=attempt_count+1 FROM selected WHERE selected.outbox_id=o.outbox_id RETURNING o.outbox_id,o.topic,o.message_key,o.payload,o.fence",&[&owner,&token,&seconds.max(1),&limit.clamp(1,100)]).await.map_err(database)?;
+        let rows=tx.query("WITH selected AS(SELECT outbox_id FROM octopus_core.dq_outbox WHERE payload->>'installation_id'=$5 AND payload->>'namespace'=$6 AND ((status='pending' AND next_attempt_at<=CURRENT_TIMESTAMP) OR(status='leased' AND lease_expires_at<=CURRENT_TIMESTAMP)) ORDER BY created_at,outbox_id FOR UPDATE SKIP LOCKED LIMIT $4::int) UPDATE octopus_core.dq_outbox o SET status='leased',owner=$1,token=$2,fence=fence+1,lease_expires_at=CURRENT_TIMESTAMP+$3::int*INTERVAL '1 second',attempt_count=attempt_count+1 FROM selected WHERE selected.outbox_id=o.outbox_id RETURNING o.outbox_id,o.topic,o.message_key,o.payload,o.fence",&[&owner,&token,&seconds.max(1),&limit.clamp(1,100),&self.settings.installation_id,&self.settings.namespace]).await.map_err(database)?;
         let values = rows
             .iter()
             .map(|r| DqOutbox {
@@ -348,6 +348,10 @@ impl DqStore {
                     != Some(dq::text(&r, "source_revision_digest")?)
             {
                 return Err(error(400, "invalid_output"));
+            }
+            let (_, output_limit) = self.artifact_limits_tx(tx, run).await?;
+            if usize::try_from(dq::long(&refs[0], "size_bytes")?).map_or(true, |size| size > output_limit) {
+                return Err(error(400, "artifact_size_exceeded"));
             }
             self.artifacts_tx(tx, run, refs).await?;
             tx.execute("UPDATE octopus_core.dq_runs SET status='applying',output_refs=$2,state_revision=state_revision+1 WHERE run_id=$1 AND status='running'",&[&run,&refs]).await.map_err(database)?;

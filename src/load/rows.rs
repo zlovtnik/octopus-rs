@@ -201,6 +201,7 @@ impl<'a> PayloadRows<'a> {
         let mut depth = 0usize;
         let mut quoted = false;
         let mut escaped = false;
+        let mut end = self.input.len();
         for (relative, byte) in bytes[start..].iter().copied().enumerate() {
             if quoted {
                 if escaped {
@@ -216,27 +217,26 @@ impl<'a> PayloadRows<'a> {
                     b'{' | b'[' => depth += 1,
                     b'}' | b']' => {
                         if depth == 0 {
-                            self.pending = Some(self.input[start..start + relative].trim());
+                            end = start + relative;
                             break;
                         }
                         depth -= 1;
                     }
                     b',' if depth == 0 => {
-                        self.pending = Some(self.input[start..start + relative].trim());
+                        end = start + relative;
                         break;
                     }
                     _ => {}
                 }
             }
         }
-        if self.pending.is_none() {
-            self.pending = Some(self.input[start..].trim());
-        }
-        if self.pending.is_some_and(|s| s.len() > self.max_bytes) {
+        let row = self.input[start..end].trim();
+        if row.len() > self.max_bytes {
             return Err(LoadError::Invalid(
                 "single PostgreSQL row exceeds byte limit",
             ));
         }
+        self.pending = Some(row);
         Ok(self.pending)
     }
     pub fn advance(&mut self) {

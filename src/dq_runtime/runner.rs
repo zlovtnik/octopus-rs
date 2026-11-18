@@ -121,33 +121,49 @@ pub fn receipt(
                 key == format!("{}/{}/{}", config.installation_id, config.namespace, r)
             })
     });
+    let envelope = envelope.filter(|value| !contains_nul(value));
     let event = envelope
         .as_ref()
         .and_then(|e| e["event_id"].as_str())
-        .filter(|v| !v.is_empty() && crate::util::utf16_length(v) <= 256)
-        .unwrap_or(&hash);
+        .filter(|v| !crate::util::java_is_blank(v) && crate::util::utf16_length(v) <= 256);
+    let valid_event = event.is_some();
+    let event = event.unwrap_or(&hash);
     let mut value = json!({"installation_id":config.installation_id,"namespace":config.namespace,"consumer_group":group,"topic":topic,"partition":partition,"offset":offset,"event_id":event,"payload_sha256":hash});
-    if let Some(e) = envelope {
+    if let Some(e) = envelope.filter(|_| valid_event) {
         value["envelope"] = e;
     } else {
         value["quarantine_reason"] = json!("invalid_record");
     }
     value
 }
+
+fn contains_nul(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value.contains('\0'),
+        Value::Array(values) => values.iter().any(contains_nul),
+        Value::Object(values) => values.iter().any(|(key, value)| key.contains('\0') || contains_nul(value)),
+        _ => false,
+    }
+}
 #[derive(Clone)]
 struct ReportContext {
     epoch: Arc<Mutex<u64>>,
     assigned: Arc<AtomicBool>,
+    reports: Arc<AtomicBool>,
 }
 impl ClientContext for ReportContext {}
 impl ConsumerContext for ReportContext {
-    fn pre_rebalance(&self, rebalance: &Rebalance<'_>) {
+    fn pre_rebalance(&self, _: &Rebalance<'_>) {
         let mut epoch = self.epoch.lock().unwrap_or_else(|e| e.into_inner());
         *epoch = epoch.wrapping_add(1);
-        self.assigned.store(
-            matches!(rebalance,Rebalance::Assign(p)if p.count()>0),
-            Ordering::Release,
-        );
+        self.assigned.store(false, Ordering::Release);
+        self.reports.store(false, Ordering::Release);
+    }
+
+    fn post_rebalance(&self, rebalance: &Rebalance<'_>) {
+        let assigned = matches!(rebalance, Rebalance::Assign(partitions) if partitions.count() > 0);
+        self.assigned.store(assigned, Ordering::Release);
+        self.reports.store(assigned, Ordering::Release);
     }
 }
 #[derive(Clone)]
@@ -261,7 +277,8 @@ impl DqRuntime {
                 .store
                 .prepare_snapshot(run, self.minimum_similarity)
                 .await?;
-            let reference = self.artifacts.put_snapshot(run, &snapshot).await?;
+            let (input_limit, _) = self.store.artifact_limits(run_id).await?;
+            let reference = self.artifacts.put_snapshot(run, &snapshot, input_limit).await?;
             self.store
                 .complete_preparation(
                     run_id,
@@ -301,24 +318,30 @@ impl DqRuntime {
                     .map(|a| &a[0])
                     .ok_or_else(|| error(400, &format!("invalid_{key}")))
             };
+            let (input_limit, output_limit) = self.store.artifact_limits(run_id).await?;
             let snapshot = self
                 .artifacts
-                .read(single("input_refs")?, run, false)
+                .read(single("input_refs")?, run, false, input_limit)
                 .await?;
             let proposal = self
                 .artifacts
-                .read(single("output_refs")?, run, true)
+                .read(single("output_refs")?, run, true, output_limit)
                 .await?;
-            self.store
-                .apply_output(
+            for retry in 0..3 {
+                let result = self.store.apply_output(
                     &self.owner,
                     run,
                     &snapshot,
                     &proposal,
                     self.minimum_similarity,
                 )
-                .await?;
-            Ok(())
+                .await;
+                if retry == 2 || !result.as_ref().is_err_and(|e| e.code == "serialization_retry") {
+                    return result.map(|_| ());
+                }
+                tokio::time::sleep(Duration::from_millis(25 << retry)).await;
+            }
+            unreachable!("bounded retries always return the final outcome")
         }
         .await;
         if let Err(e) = &work {
@@ -442,9 +465,11 @@ impl DqRuntime {
     }
     async fn reports(&self, stop: CancellationToken) -> Result<()> {
         let epoch = Arc::new(Mutex::new(0u64));
+        let scope = dq::sha256(&json!([self.config.installation_id, self.config.namespace]))?;
+        let group = format!("{REPORT_GROUP}-{scope}");
         let mut cfg = ClientConfig::new();
         cfg.set("bootstrap.servers", &self.kafka.bootstrap_servers)
-            .set("group.id", REPORT_GROUP)
+            .set("group.id", &group)
             .set("auto.offset.reset", "earliest")
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
@@ -455,6 +480,7 @@ impl DqRuntime {
             .create_with_context(ReportContext {
                 epoch: epoch.clone(),
                 assigned: self.assigned.clone(),
+                reports: self.reports.clone(),
             })
             .map_err(|_| error(503, "dq_reports_unavailable"))?;
         consumer
@@ -472,7 +498,7 @@ impl DqRuntime {
                 .unwrap_or("");
             let receipt = receipt(
                 &self.config,
-                REPORT_GROUP,
+                &group,
                 &topic,
                 partition,
                 offset,
@@ -493,7 +519,7 @@ impl DqRuntime {
                 }
             }
             let current = epoch.lock().unwrap_or_else(|e| e.into_inner());
-            if *current != generation {
+            if *current != generation || !self.assigned.load(Ordering::Acquire) {
                 continue;
             }
             let mut offsets = TopicPartitionList::new();

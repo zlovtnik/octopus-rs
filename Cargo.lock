@@ -1102,6 +1102,7 @@ name = "octopus"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bigdecimal",
  "chrono",
  "deadpool-postgres",
@@ -1118,6 +1119,7 @@ dependencies = [
  "rdkafka",
  "regex",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1130,6 +1132,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "unicode-normalization",
  "uuid",
 ]
 

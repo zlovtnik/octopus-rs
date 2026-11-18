@@ -193,6 +193,18 @@ impl MinioStore {
         bytes: Option<&[u8]>,
         sha_metadata: Option<&str>,
     ) -> Result<Response, ArchiveError> {
+        self.request_with_condition(method, key, query, bytes, sha_metadata, false).await
+    }
+
+    async fn request_with_condition(
+        &self,
+        method: Method,
+        key: &str,
+        query: BTreeMap<String, String>,
+        bytes: Option<&[u8]>,
+        sha_metadata: Option<&str>,
+        create_only: bool,
+    ) -> Result<Response, ArchiveError> {
         let now = Utc::now();
         let date = now.format("%Y%m%d").to_string();
         let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -212,6 +224,9 @@ impl MinioStore {
         ]);
         if let Some(sha) = sha_metadata {
             signed.insert("x-amz-meta-sha256", sha.into());
+        }
+        if create_only {
+            signed.insert("if-none-match", "*".into());
         }
         let canonical_headers = signed
             .iter()
@@ -353,15 +368,27 @@ impl MinioStore {
         if !lowercase_sha256(sha) || sha256_hex(bytes) != sha {
             return Err(ArchiveError::Integrity);
         }
-        if verified(self.stat_versioned(key, None).await?, bytes.len(), sha)? {
-            return Ok(());
-        }
-        self.put_versioned(key, bytes, sha).await?;
-        if verified(self.stat_versioned(key, None).await?, bytes.len(), sha)? {
-            Ok(())
+        let version = if let Some(existing) = self.stat_versioned(key, None).await? {
+            existing.version_id.clone()
         } else {
-            Err(ArchiveError::Integrity)
+            let response = self.request_with_condition(Method::PUT, key, BTreeMap::new(), Some(bytes), Some(sha), true).await?;
+            if response.status() == StatusCode::PRECONDITION_FAILED {
+                self.stat_versioned(key, None).await?.ok_or(ArchiveError::Integrity)?.version_id
+            } else if response.status().is_success() {
+                metadata(response.headers(), false)?.version_id
+            } else {
+                return Err(status_error(response.status()));
+            }
+        };
+        let existing = self.stat_versioned(key, version.as_deref()).await?.ok_or(ArchiveError::Integrity)?;
+        if existing.size != bytes.len() as i64 || existing.sha256.as_deref().is_some_and(|value| value != sha) {
+            return Err(ArchiveError::Integrity);
         }
+        let stored = self.get_versioned(key, existing.version_id.as_deref(), bytes.len()).await?;
+        if stored != bytes {
+            return Err(ArchiveError::Integrity);
+        }
+        Ok(())
     }
 
     pub async fn get_versioned(
@@ -517,18 +544,6 @@ fn metadata(headers: &HeaderMap, require_size: bool) -> Result<StoredObject, Arc
     })
 }
 
-fn verified(stored: Option<StoredObject>, size: usize, sha: &str) -> Result<bool, ArchiveError> {
-    match stored {
-        Some(stored) if stored.size != size as i64 => Err(ArchiveError::Integrity),
-        Some(stored) => match stored.sha256 {
-            Some(value) if value == sha => Ok(true),
-            Some(_) => Err(ArchiveError::Integrity),
-            None => Ok(false),
-        },
-        None => Ok(false),
-    }
-}
-
 async fn read_bounded(response: Response, max_bytes: usize) -> Result<Vec<u8>, ArchiveError> {
     if response
         .content_length()
@@ -682,23 +697,6 @@ mod tests {
         assert!(presigned.contains("versionId=version%2F%2B"));
         assert!(presigned.contains("X-Amz-Signature="));
     }
-    #[test]
-    fn archive_verification_never_overwrites_conflicting_objects() {
-        let object = |size, sha: Option<&str>| {
-            Some(StoredObject {
-                size,
-                sha256: sha.map(str::to_string),
-                version_id: None,
-                etag: "etag".into(),
-            })
-        };
-        assert!(!verified(None, 3, "hash").unwrap());
-        assert!(!verified(object(3, None), 3, "hash").unwrap());
-        assert!(verified(object(3, Some("hash")), 3, "hash").unwrap());
-        assert!(verified(object(4, None), 3, "hash").is_err());
-        assert!(verified(object(3, Some("other")), 3, "hash").is_err());
-    }
-
     #[test]
     fn version_xml_is_bounded_and_decodes_escaped_keys() {
         let xml = r#"<ListVersionsResult><Version><Key>i/n/a&amp;b</Key><VersionId>id</VersionId><LastModified>2026-01-01T00:00:00Z</LastModified></Version><DeleteMarker><Key>gone</Key><VersionId>deleted-id</VersionId><LastModified>2026-01-01T00:00:01Z</LastModified></DeleteMarker><IsTruncated>true</IsTruncated><NextKeyMarker>next&amp;key</NextKeyMarker><NextVersionIdMarker>next-version</NextVersionIdMarker></ListVersionsResult>"#;

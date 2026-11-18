@@ -71,8 +71,8 @@ impl DqStore {
         if !active {
             return Err(error(403, "beta_disabled"));
         }
-        let version = if let Some(v) = dq::optional(request, "processor_version") {
-            v.to_owned()
+        let version = if request.get("processor_version").is_some() {
+            dq::text(request, "processor_version")?.to_owned()
         } else {
             tx.query("SELECT default_version FROM octopus_core.dq_processors WHERE installation_id=$1 AND namespace=$2 AND processor_id=$3",&[&self.settings.installation_id,&self.settings.namespace,&processor]).await.map_err(database)?.first().ok_or_else(||error(404,"processor_not_found"))?.get(0)
         };
@@ -135,13 +135,14 @@ impl DqStore {
         candidate: &str,
         run: &str,
     ) -> Result<()> {
-        let rows=tx.execute("INSERT INTO octopus_core.dq_decision_sources(candidate_id,decision,decision_revision,run_id) SELECT d.candidate_id,d.decision,encode(sha256(convert_to(jsonb_build_array($1::text,$2::text,$3::text,$4::text,$5::text,d.candidate_id,d.decision)::text,'UTF8')),'hex'),$7 FROM atheros_search.merge_decisions d JOIN atheros_search.merge_candidates c USING(candidate_id) JOIN atheros_search.devices l ON l.mac=c.mac_a JOIN atheros_search.devices r ON r.mac=c.mac_b WHERE d.candidate_id=$6 AND ($3='*' OR(l.location_id=$3 AND r.location_id=$3)) ON CONFLICT(candidate_id,decision_revision) DO UPDATE SET run_id=EXCLUDED.run_id WHERE dq_decision_sources.completed_at IS NULL",&[&self.settings.installation_id,&self.settings.namespace,&scope,&self.settings.policy_version,&mode,&candidate,&run]).await.map_err(database)?;
+        let rows=tx.execute("INSERT INTO octopus_core.dq_decision_sources(candidate_id,decision,decision_revision,run_id) SELECT d.candidate_id,d.decision,encode(sha256(convert_to(jsonb_build_array($1::text,$2::text,$3::text,$4::text,$5::text,d.candidate_id,d.decision)::text,'UTF8')),'hex'),$7 FROM atheros_search.merge_decisions d JOIN atheros_search.merge_candidates c USING(candidate_id) JOIN atheros_search.devices l ON l.mac=c.mac_a JOIN atheros_search.devices r ON r.mac=c.mac_b WHERE d.candidate_id=$6 AND ($3='*' OR(l.location_id=$3 AND r.location_id=$3)) ON CONFLICT(candidate_id,decision_revision) DO UPDATE SET run_id=EXCLUDED.run_id WHERE dq_decision_sources.completed_at IS NULL AND EXISTS(SELECT 1 FROM octopus_core.dq_runs prior WHERE prior.run_id=dq_decision_sources.run_id AND prior.status IN ('failed','cancelled'))",&[&self.settings.installation_id,&self.settings.namespace,&scope,&self.settings.policy_version,&mode,&candidate,&run]).await.map_err(database)?;
         // An already completed immutable decision is not an available admission.
         if rows == 0 {
             let exists:bool=tx.query("SELECT EXISTS(SELECT 1 FROM atheros_search.merge_decisions d JOIN atheros_search.merge_candidates c USING(candidate_id) JOIN atheros_search.devices l ON l.mac=c.mac_a JOIN atheros_search.devices r ON r.mac=c.mac_b WHERE d.candidate_id=$1 AND ($2='*' OR(l.location_id=$2 AND r.location_id=$2)))",&[&candidate,&scope]).await.map_err(database)?[0].get(0);
             if !exists {
                 return Err(error(404, "decision_not_found"));
             }
+            return Err(error(409, "decision_revision_already_claimed"));
         }
         Ok(())
     }
@@ -204,6 +205,7 @@ impl DqStore {
             || !regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9.-]*:[0-9]{1,5}$")
                 .expect("constant regex")
                 .is_match(address)
+            || !address.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok()).is_some_and(|port| port > 0)
             || !(1..=256).contains(&concurrency)
         {
             return Err(error(400, "invalid_worker"));
@@ -315,7 +317,7 @@ impl DqStore {
             return Err(error(409, "policy_changed"));
         }
         let deadline = dq::text(&r, "deadline_at")?;
-        let changed=tx.execute("UPDATE octopus_core.dq_attempts SET status=CASE WHEN $6 AND status='reserved' THEN 'accepted' ELSE status END,lease_expires_at=LEAST($7::text::timestamptz,CURRENT_TIMESTAMP+$8::int*INTERVAL '1 second') WHERE attempt_id=$1 AND run_id=$2 AND worker_instance_id=$3 AND lease_token=$4 AND fence=$5 AND status IN ('reserved','accepted','running','applying') AND lease_expires_at>CURRENT_TIMESTAMP AND EXISTS(SELECT 1 FROM octopus_core.dq_runs WHERE run_id=$2 AND current_attempt_id=$1 AND fence=$5 AND status IN ('running','applying'))",&[&attempt,&run,&worker,&token,&fence,&accept,&deadline,&self.settings.lease_seconds]).await.map_err(database)?;
+        let changed=tx.execute("WITH sampled AS MATERIALIZED (SELECT clock_timestamp() AS now) UPDATE octopus_core.dq_attempts SET status=CASE WHEN $6 AND status='reserved' THEN 'accepted' ELSE status END,lease_expires_at=LEAST($7::text::timestamptz,sampled.now+$8::int*INTERVAL '1 second') FROM sampled WHERE attempt_id=$1 AND run_id=$2 AND worker_instance_id=$3 AND lease_token=$4 AND fence=$5 AND status IN ('reserved','accepted','running','applying') AND lease_expires_at>sampled.now AND $7::text::timestamptz>sampled.now AND EXISTS(SELECT 1 FROM octopus_core.dq_runs WHERE run_id=$2 AND current_attempt_id=$1 AND fence=$5 AND status IN ('running','applying'))",&[&attempt,&run,&worker,&token,&fence,&accept,&deadline,&self.settings.lease_seconds]).await.map_err(database)?;
         if changed != 1 {
             return Err(error(409, "stale_lease"));
         }

@@ -96,14 +96,36 @@ async fn candidates(tx:&mut PgTransaction,kind:SearchKind,limit:i32)->Result<Vec
     let statement=format!("WITH source AS ({base}) SELECT source.key,source.source_mac,source.location_id,source.sensor_id,source.observed_at,source.bssid,source.ssid,source.detail FROM source LEFT JOIN atheros_search.search_documents doc ON doc.source_kind=$1 AND doc.source_key=source.key AND doc.status='active' WHERE doc.document_id IS NULL OR doc.updated_at<source.updated_at ORDER BY source.updated_at,source.key LIMIT $2::int");
     Ok(tx.query(&statement,&[&kind.source_kind(),&limit.max(1)]).await?.into_iter().map(|r|{let detail:Value=r.get(7);let mut s=SearchSource::new(kind,r.get(0),r.get(4),detail.to_string(),detail);s.source_mac=r.get(1);s.location_id=r.get(2);s.sensor_id=r.get(3);s.bssid=r.get(5);s.ssid=r.get(6);s}).collect())
 }
-pub async fn enqueue_embedding(tx:&mut PgTransaction,document_id:&str,kind:SearchKind,model:&str,checksum:&str)->Result<(),ProjectionError>{
-    let job_id=crate::util::stable_uuid("embedding",&[document_id,kind.embedding_kind(),model,checksum]);
-    tx.execute("INSERT INTO atheros_search.embedding_jobs(job_id,document_id,embedding_kind,embedding_model,content_sha256,status,priority,attempt_count,max_attempts,next_attempt_at,created_at,updated_at) VALUES($1::text::uuid,$2::text::uuid,$3,$4,$5,'pending',100,0,5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(document_id,embedding_kind,embedding_model,content_sha256,input_revision) DO UPDATE SET job_id=embedding_jobs.job_id",&[&job_id,&document_id,&kind.embedding_kind(),&model,&checksum]).await?;Ok(())
+async fn enqueue_embedding(tx:&mut PgTransaction,document_id:&str,kind:SearchKind,model:&str,checksum:&str,revision:&str)->Result<i32,ProjectionError>{
+    let mut identity = vec![document_id, kind.embedding_kind(), model, checksum];
+    if revision != "legacy_unknown" {
+        identity.push(revision);
+    }
+    let job_id=crate::util::stable_uuid("embedding",&identity);
+    let inserted = tx.execute("INSERT INTO atheros_search.embedding_jobs(job_id,document_id,embedding_kind,embedding_model,content_sha256,input_revision,status,priority,attempt_count,max_attempts,next_attempt_at,created_at,updated_at) VALUES($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,'pending',100,0,5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(document_id,embedding_kind,embedding_model,content_sha256,input_revision) DO NOTHING",&[&job_id,&document_id,&kind.embedding_kind(),&model,&checksum,&revision]).await?;
+    Ok(inserted as i32)
 }
 impl ProjectionStore{
     fn supported_search_kinds(&self)->impl Iterator<Item=SearchKind>+'_ {SearchKind::NON_PROXY.into_iter().filter(|kind|if self.wireless.projection_only(){kind.compact()||kind.source_table()=="proxy_events"}else{!kind.compact()||self.wireless.enabled()})}
     pub async fn build_search_documents(&self,limit:i32)->Result<i32,ProjectionError>{
         let mut tx=self.runtime.begin_worker().await?;let mut count=0;
+        if self.supported_search_kinds().any(|kind| kind == SearchKind::IdentitySummary) {
+            tx.execute(
+                "WITH revoked AS (
+                   UPDATE atheros_search.search_documents document
+                   SET status='superseded',updated_at=clock_timestamp()
+                   WHERE document.source_kind='identity_summary' AND document.status='active'
+                     AND NOT EXISTS(SELECT 1 FROM atheros_search.identity_clusters cluster
+                                    WHERE cluster.cluster_id=document.source_key AND cluster.status='active')
+                   RETURNING document_id
+                 )
+                 UPDATE atheros_search.embedding_jobs job
+                 SET status='cancelled',owner_id=NULL,lease_token=NULL,lease_expires_at=NULL,
+                     last_error='identity summary revoked',updated_at=clock_timestamp()
+                 FROM revoked WHERE job.document_id=revoked.document_id AND job.status IN ('pending','leased')",
+                &[],
+            ).await?;
+        }
         for kind in self.supported_search_kinds(){for source in candidates(&mut tx,kind,limit).await?{persist_document(&mut tx,&prepare_source(source)?,false).await?;count+=1;}}
         tx.commit().await?;Ok(count)
     }
@@ -111,8 +133,10 @@ impl ProjectionStore{
     pub async fn prepare_embedding_jobs(&self,limit:i32,model:&str)->Result<i32,ProjectionError>{
         let mut tx=self.runtime.begin_worker().await?;let mut count=0;
         for kind in self.supported_search_kinds(){
-            let rows=tx.query("SELECT document.document_id::text,document.normalized_sha256 FROM atheros_search.search_documents document LEFT JOIN atheros_search.embedding_jobs job ON job.document_id=document.document_id AND job.embedding_kind=$1 AND job.embedding_model=$2 AND job.content_sha256=document.normalized_sha256 AND job.input_revision=document.input_revision WHERE document.status='active' AND document.source_kind=$3 AND job.job_id IS NULL ORDER BY document.observed_at,document.document_id LIMIT $4::int",&[&kind.embedding_kind(),&model,&kind.source_kind(),&limit.max(1)]).await?;
-            for row in rows{enqueue_embedding(&mut tx,&row.get::<_,String>(0),kind,model,&row.get::<_,String>(1)).await?;count+=1;}
+            let rows=tx.query("SELECT document.document_id::text,document.normalized_sha256,document.input_revision FROM atheros_search.search_documents document LEFT JOIN atheros_search.embedding_jobs job ON job.document_id=document.document_id AND job.embedding_kind=$1 AND job.embedding_model=$2 AND job.content_sha256=document.normalized_sha256 AND job.input_revision=document.input_revision WHERE document.status='active' AND document.source_kind=$3 AND job.job_id IS NULL ORDER BY document.observed_at,document.document_id LIMIT $4::int FOR UPDATE OF document SKIP LOCKED",&[&kind.embedding_kind(),&model,&kind.source_kind(),&limit.max(1)]).await?;
+            for row in rows {
+                count += enqueue_embedding(&mut tx,&row.get::<_,String>(0),kind,model,&row.get::<_,String>(1),&row.get::<_,String>(2)).await?;
+            }
         }
         tx.commit().await?;Ok(count)
     }

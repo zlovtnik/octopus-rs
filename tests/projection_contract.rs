@@ -246,16 +246,15 @@ async fn compact_projection_replay_conflict_window_and_expiry_are_atomic() {
         Err(ProjectionError::CoordinateConflict)
     ));
     let mut tx = runtime.begin_worker().await.unwrap();
-    assert_eq!(
-        tx.query(
-            "SELECT frame_count FROM atheros_search.wireless_observation_summaries",
-            &[]
-        )
-        .await
-        .unwrap()[0]
-            .get::<_, i64>(0),
-        1
-    );
+    let associations = tx.query(
+        "SELECT summary.frame_count,edge.edge_id FROM atheros_search.wireless_observation_summaries summary
+         JOIN atheros_search.wireless_topology_edges edge ON edge.edge_id='observation:' || summary.summary_id::text
+         WHERE edge.edge_kind='observed_association'",
+        &[],
+    ).await.unwrap();
+    assert_eq!(associations.len(), 1, "fixture must create an observed association");
+    assert_eq!(associations[0].get::<_, i64>(0), 1);
+    let edge_id: String = associations[0].get(1);
     tx.commit().await.unwrap();
     event["observed_at"] = json!((Utc::now() - Duration::days(8)).to_rfc3339());
     assert!(!store
@@ -268,7 +267,10 @@ async fn compact_projection_replay_conflict_window_and_expiry_are_atomic() {
     fixture.admin("UPDATE atheros_search.wireless_observation_summaries SET expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second'; UPDATE octopus_core.wireless_projection_group_receipts SET expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second'; UPDATE octopus_core.wireless_projection_hashes SET expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second';");
     assert_eq!(store.expire_wireless_projections(10).await.unwrap(), 1);
     let mut tx = runtime.begin_worker().await.unwrap();
-    assert_eq!(tx.query("SELECT count(*) FROM atheros_search.wireless_topology_edges WHERE edge_kind='observed_association'",&[]).await.unwrap()[0].get::<_,i64>(0),0);
+    assert!(tx.query(
+        "SELECT edge_id FROM atheros_search.wireless_topology_edges WHERE edge_id=$1",
+        &[&edge_id],
+    ).await.unwrap().is_empty());
     tx.commit().await.unwrap();
 }
 #[tokio::test]

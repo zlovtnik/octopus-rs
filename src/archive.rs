@@ -67,9 +67,9 @@ pub struct ArchiveCandidate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchiveReceipt {
-    pub uri: String,
-    pub payload_bytes: i64,
-    pub payload_sha256: String,
+    uri: String,
+    payload_bytes: i64,
+    payload_sha256: String,
 }
 
 pub fn lowercase_sha256(value: &str) -> bool {
@@ -135,6 +135,14 @@ impl PayloadArchiver {
     }
 
     pub async fn archive_once(&self) -> Result<u64, ArchiveError> {
+        self.archive_candidates(None, || {}).await
+    }
+
+    async fn archive_candidates(
+        &self,
+        lease: Option<&MaintenanceLease>,
+        mut archived_one: impl FnMut(),
+    ) -> Result<u64, ArchiveError> {
         let mut tx = self.runtime.begin_worker().await?;
         let days = self.config.hot_days.max(1);
         let limit = i64::from(self.config.batch_size.max(1));
@@ -154,12 +162,16 @@ impl PayloadArchiver {
         for candidate in candidates {
             match self.objects.archive(&candidate).await {
                 Ok(receipt) => {
-                    self.record_archive(&candidate, &receipt).await?;
+                    self.record_archive_fenced(&candidate, &receipt, lease).await?;
                     archived += 1;
+                    archived_one();
                 }
                 Err(error @ ArchiveError::InvalidCandidate(_)) => {
                     let mut tx = self.runtime.begin_worker().await?;
-                    tx.execute("UPDATE sync_events SET status='failed',attempt_count=attempt_count+1,last_error=$3,updated_at=CURRENT_TIMESTAMP WHERE dedupe_key=$1 AND stream_name=$2 AND payload_archived=false AND status<>'failed'", &[&candidate.dedupe_key,&candidate.stream_name,&error.to_string()]).await?;
+                    if let Some(lease) = lease {
+                        retention::guard(&mut tx, "event-retention", lease).await?;
+                    }
+                    tx.execute("UPDATE sync_events SET status='failed',attempt_count=attempt_count+1,last_error=$3,updated_at=CURRENT_TIMESTAMP WHERE dedupe_key=$1 AND stream_name=$2 AND payload_archived=false AND status<>'failed' AND payload_sha256=$4 AND observed_at=$5", &[&candidate.dedupe_key,&candidate.stream_name,&error.to_string(),&candidate.payload_sha256,&candidate.observed_at]).await?;
                     tx.commit().await?;
                 }
                 Err(error) => return Err(error),
@@ -173,6 +185,15 @@ impl PayloadArchiver {
         candidate: &ArchiveCandidate,
         receipt: &ArchiveReceipt,
     ) -> Result<(), ArchiveError> {
+        self.record_archive_fenced(candidate, receipt, None).await
+    }
+
+    async fn record_archive_fenced(
+        &self,
+        candidate: &ArchiveCandidate,
+        receipt: &ArchiveReceipt,
+        lease: Option<&MaintenanceLease>,
+    ) -> Result<(), ArchiveError> {
         if receipt.payload_sha256 != candidate.payload_sha256
             || receipt.payload_bytes != candidate.payload.len() as i64
             || receipt.payload_sha256 != sha256_hex(&candidate.payload)
@@ -184,8 +205,11 @@ impl PayloadArchiver {
             return Err(ArchiveError::Integrity);
         }
         let mut tx = self.runtime.begin_worker().await?;
+        if let Some(lease) = lease {
+            retention::guard(&mut tx, "event-retention", lease).await?;
+        }
         tx.execute("INSERT INTO sync_event_payload_archives(dedupe_key,stream_name,observed_at,payload_sha256,archive_uri,payload_bytes,archived_at,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(dedupe_key,stream_name) DO UPDATE SET archive_uri=EXCLUDED.archive_uri,payload_bytes=EXCLUDED.payload_bytes,updated_at=CURRENT_TIMESTAMP", &[&candidate.dedupe_key,&candidate.stream_name,&candidate.observed_at,&receipt.payload_sha256,&receipt.uri,&receipt.payload_bytes]).await?;
-        let updated=tx.execute("UPDATE sync_events SET payload_archive_uri=$3,archived_payload_bytes=$4,payload_archived_at=CURRENT_TIMESTAMP,payload_archived=true,payload=NULL,updated_at=CURRENT_TIMESTAMP WHERE dedupe_key=$1 AND stream_name=$2 AND payload_archived=false AND payload_sha256=$5 AND payload IS NOT NULL", &[&candidate.dedupe_key,&candidate.stream_name,&receipt.uri,&receipt.payload_bytes,&receipt.payload_sha256]).await?;
+        let updated=tx.execute("UPDATE sync_events SET payload_archive_uri=$3,archived_payload_bytes=$4,payload_archived_at=CURRENT_TIMESTAMP,payload_archived=true,payload=NULL,updated_at=CURRENT_TIMESTAMP WHERE dedupe_key=$1 AND stream_name=$2 AND payload_archived=false AND payload_sha256=$5 AND payload IS NOT NULL AND observed_at=$6", &[&candidate.dedupe_key,&candidate.stream_name,&receipt.uri,&receipt.payload_bytes,&receipt.payload_sha256,&candidate.observed_at]).await?;
         if updated != 1 {
             return Err(ArchiveError::CandidateChanged);
         }

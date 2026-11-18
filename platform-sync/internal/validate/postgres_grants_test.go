@@ -38,9 +38,10 @@ func TestAtherosSearchGrantMatricesMatchCanonicalSQL(t *testing.T) {
 			sequences: atherosSearchSequenceGrants(),
 		},
 		{
-			name:   "Octopus runtime",
-			role:   "{{OCTOPUS_ACCOUNT}}",
-			tables: octopusAtherosGrants(),
+			name:      "Octopus runtime",
+			role:      "{{OCTOPUS_ACCOUNT}}",
+			tables:    octopusAtherosGrants(),
+			sequences: octopusAtherosSequenceGrants(),
 		},
 	}
 
@@ -142,7 +143,7 @@ func canonicalGrantFixture(t *testing.T, schema string) string {
 	}
 	return filepath.Clean(filepath.Join(
 		filepath.Dir(filename),
-		"..", "..", "..", "..",
+		"..", "..", "..", "..", "..",
 		"sql", "postgres", schema, "grants", "least_privilege.sql.tmpl",
 	))
 }

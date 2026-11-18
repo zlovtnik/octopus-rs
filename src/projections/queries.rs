@@ -160,8 +160,15 @@ pub const PROJECT_GRAPH_5: &str = r#"INSERT INTO atheros_search.graph_nodes (
                                   jsonb_build_object('cluster_size', cluster.cluster_size),
                                   FALSE, cluster.last_seen, $1
                            FROM atheros_search.identity_clusters cluster
+                           LEFT JOIN atheros_search.graph_nodes existing
+                             ON existing.node_id = CONCAT('identity:', cluster.cluster_id)
                            WHERE cluster.status = 'active'
-                           ORDER BY cluster.last_seen DESC, cluster.cluster_id
+                           ORDER BY (existing.node_id IS NULL) DESC,
+                                    (existing.label IS DISTINCT FROM cluster.cluster_name
+                                     OR existing.node_payload IS DISTINCT FROM jsonb_build_object('cluster_size', cluster.cluster_size)
+                                     OR cluster.last_seen > existing.observed_at) DESC NULLS LAST,
+                                    existing.updated_at ASC NULLS FIRST,
+                                    cluster.last_seen DESC, cluster.cluster_id
                            LIMIT $2::int
                     ON CONFLICT (node_id) DO UPDATE SET
                       label = EXCLUDED.label,
@@ -219,6 +226,8 @@ pub const PROJECT_GRAPH_7: &str = r#"INSERT INTO atheros_search.graph_edges (
                                     'approved identity membership',
                                     member.evidence, member.last_seen, $1
                              FROM atheros_search.identity_cluster_members member
+                             LEFT JOIN atheros_search.graph_edges existing
+                               ON existing.edge_id = CONCAT('identity-member:', member.cluster_id, ':', member.mac)
                              WHERE EXISTS (
                                SELECT 1 FROM atheros_search.graph_nodes device_node
                                WHERE device_node.node_id = CONCAT('device:', member.mac)
@@ -227,7 +236,11 @@ pub const PROJECT_GRAPH_7: &str = r#"INSERT INTO atheros_search.graph_edges (
                                SELECT 1 FROM atheros_search.graph_nodes cluster_node
                                WHERE cluster_node.node_id = CONCAT('identity:', member.cluster_id)
                              )
-                             ORDER BY member.last_seen DESC, member.cluster_id, member.mac
+                             ORDER BY (existing.edge_id IS NULL
+                                       OR existing.weight IS DISTINCT FROM member.confidence
+                                       OR existing.evidence IS DISTINCT FROM member.evidence
+                                       OR member.last_seen > existing.observed_at) DESC NULLS LAST,
+                                      member.last_seen DESC, member.cluster_id, member.mac
                              LIMIT $2::int
                              ON CONFLICT (edge_id) DO UPDATE SET
                                weight = EXCLUDED.weight,
@@ -253,6 +266,8 @@ pub const PROJECT_GRAPH_8: &str = r#"INSERT INTO atheros_search.graph_edges (
                                          'confirmation_source', candidate.confirmation_source
                                        ), candidate.confirmed_at, $1
                                 FROM atheros_search.merge_candidates candidate
+                                LEFT JOIN atheros_search.graph_edges existing
+                                  ON existing.edge_id = CONCAT('same-device:', candidate.candidate_id)
                                 WHERE candidate.status = 'confirmed'
                                   AND (
                                     (candidate.confirmation_source = 'human' AND EXISTS (
@@ -289,7 +304,14 @@ pub const PROJECT_GRAPH_8: &str = r#"INSERT INTO atheros_search.graph_edges (
                                     SELECT 1 FROM atheros_search.graph_nodes right_node
                                     WHERE right_node.node_id = CONCAT('device:', candidate.mac_b)
                                   )
-                                ORDER BY candidate.confirmed_at, candidate.candidate_id
+                                ORDER BY (existing.edge_id IS NULL
+                                          OR existing.weight IS DISTINCT FROM candidate.confidence
+                                          OR existing.observed_at IS DISTINCT FROM candidate.confirmed_at
+                                          OR existing.evidence IS DISTINCT FROM jsonb_build_object(
+                                            'candidate_id', candidate.candidate_id,
+                                            'confirmation_source', candidate.confirmation_source
+                                          )) DESC,
+                                         candidate.confirmed_at, candidate.candidate_id
                                 LIMIT $3::int
                                 ON CONFLICT (edge_id) DO UPDATE SET
                                   weight = EXCLUDED.weight,
@@ -462,28 +484,46 @@ pub const PROJECT_GRAPH_11: &str = r#"INSERT INTO atheros_search.graph_edges (
                                  updated_at = CURRENT_TIMESTAMP"#;
 
 // Parameters: 1=batchLimit
-pub const PROJECT_GRAPH_12: &str = r#"INSERT INTO atheros_search.ap_catalog (
+pub const PROJECT_GRAPH_12: &str = r#"WITH observed AS (
+                         SELECT frame.bssid, MIN(frame.observed_at) AS first_observed_at,
+                                MAX(frame.observed_at) AS last_observed_at,
+                                (array_agg(frame.sensor_id ORDER BY frame.observed_at DESC, frame.dedupe_key DESC))[1] AS last_sensor_id
+                         FROM wireless_frames frame
+                         WHERE frame.bssid IS NOT NULL
+                         GROUP BY frame.bssid
+                       ), networks AS (
+                         SELECT bssid, BOOL_OR(enabled) AS authorized,
+                                MAX(label) FILTER (WHERE enabled) AS authorized_label
+                         FROM octopus_core.wireless_authorized_networks
+                         GROUP BY bssid
+                       )
+                       INSERT INTO atheros_search.ap_catalog (
                            bssid, authorized, authorized_label, first_observed_at,
                            last_observed_at, last_sensor_id, updated_at
                          )
-                         SELECT frame.bssid,
-                                COALESCE(BOOL_OR(network.enabled), FALSE),
-                                MAX(network.label) FILTER (WHERE network.enabled),
-                                MIN(frame.observed_at), MAX(frame.observed_at),
-                                MAX(frame.sensor_id), CURRENT_TIMESTAMP
-                         FROM wireless_frames frame
-                         LEFT JOIN octopus_core.wireless_authorized_networks network
-                           ON network.bssid = frame.bssid
-                         WHERE frame.bssid IS NOT NULL
-                         GROUP BY frame.bssid
-                         ORDER BY MAX(frame.observed_at) DESC, frame.bssid
+                         SELECT observed.bssid,
+                                COALESCE(network.authorized, FALSE), network.authorized_label,
+                                observed.first_observed_at, observed.last_observed_at,
+                                observed.last_sensor_id, CURRENT_TIMESTAMP
+                         FROM observed
+                         LEFT JOIN networks network USING (bssid)
+                         LEFT JOIN atheros_search.ap_catalog existing USING (bssid)
+                         WHERE existing.bssid IS NULL
+                            OR COALESCE(network.authorized, FALSE) IS DISTINCT FROM existing.authorized
+                            OR network.authorized_label IS DISTINCT FROM existing.authorized_label
+                            OR observed.first_observed_at < existing.first_observed_at
+                            OR observed.last_observed_at > existing.last_observed_at
+                            OR (observed.last_observed_at = existing.last_observed_at
+                                AND observed.last_sensor_id IS DISTINCT FROM existing.last_sensor_id)
+                         ORDER BY observed.last_observed_at DESC, observed.bssid
                          LIMIT $1::int
                          ON CONFLICT (bssid) DO UPDATE SET
                            authorized = EXCLUDED.authorized,
                            authorized_label = EXCLUDED.authorized_label,
                            first_observed_at = LEAST(ap_catalog.first_observed_at, EXCLUDED.first_observed_at),
                            last_observed_at = GREATEST(ap_catalog.last_observed_at, EXCLUDED.last_observed_at),
-                           last_sensor_id = EXCLUDED.last_sensor_id,
+                           last_sensor_id = CASE WHEN EXCLUDED.last_observed_at >= ap_catalog.last_observed_at
+                                                THEN EXCLUDED.last_sensor_id ELSE ap_catalog.last_sensor_id END,
                            updated_at = CURRENT_TIMESTAMP"#;
 
 // Parameters: 1=batchLimit
@@ -629,18 +669,24 @@ pub const PROJECT_GRAPH_17: &str = r#"DELETE FROM atheros_search.graph_edges edg
                                      )"#;
 
 // Parameters:
-pub const PROJECT_GRAPH_18: &str = r#"WITH source AS (
+pub const PROJECT_GRAPH_18: &str = r#"WITH retained_pairs AS MATERIALIZED (
+                                SELECT source_mac, bssid, MAX(observed_at) AS observed_at
+                                FROM wireless_frames
+                                WHERE source_mac IS NOT NULL AND bssid IS NOT NULL
+                                GROUP BY source_mac,bssid
+                              ), source AS (
                                 SELECT MAX(observed_at) AS source_watermark_at,
                                        COUNT(DISTINCT (source_mac, bssid)) AS pair_count,
                                        COUNT(DISTINCT source_mac) AS mac_count
-                                FROM wireless_frames
-                                WHERE source_mac IS NOT NULL AND bssid IS NOT NULL
+                                FROM retained_pairs
                               ),
                               projection AS (
-                                SELECT MAX(observed_at) AS projection_watermark_at,
+                                SELECT MAX(edge.observed_at) AS projection_watermark_at,
                                        COUNT(*) AS pair_count
-                                FROM atheros_search.graph_edges
-                                WHERE edge_kind = 'observed_at'
+                                FROM retained_pairs pair
+                                JOIN atheros_search.graph_edges edge
+                                  ON edge.edge_id = CONCAT('observed:', pair.source_mac, ':', pair.bssid)
+                                 AND edge.edge_kind = 'observed_at'
                               ),
                               devices AS (
                                 SELECT COUNT(*) AS device_count
@@ -782,7 +828,8 @@ pub const RESOLVE_STALE_DNS_THREATS_0: &str = r#"WITH stale AS (
 // Parameters: 1=limit.max(1)
 pub const DNS_CANDIDATES_0: &str = r#"WITH hosts AS (
              SELECT host, COUNT(*) AS blocked_count,
-                    COALESCE(SUM(bytes_up + bytes_down), 0) AS attempted_bytes,
+                    LEAST(COALESCE(SUM(bytes_up::numeric + bytes_down::numeric), 0),
+                          9223372036854775807::numeric)::bigint AS attempted_bytes,
                     SUM(CASE WHEN event_time >= CURRENT_TIMESTAMP - INTERVAL '1 day' THEN 1 ELSE 0 END) AS recent_count,
                     MAX(event_time) AS last_seen
              FROM proxy_events
@@ -947,7 +994,7 @@ pub const NORMALIZE_1: &str = r#"WITH missing AS MATERIALIZED (SELECT frame.dedu
              WHERE event.dedupe_key = frame.dedupe_key AND event.stream_name = 'wireless.audit'
            )
            ORDER BY frame.observed_at, frame.dedupe_key
-           LIMIT $1::int) INSERT INTO wireless_frame_radio (
+           LIMIT $1::int), inserted AS (INSERT INTO wireless_frame_radio (
                dedupe_key, signal_dbm, noise_dbm, frequency_mhz, channel_flags,
                data_rate_kbps, antenna_id, tsft, fragment_number, channel_number,
                tsft_delta_us, wall_clock_delta_ms
@@ -958,7 +1005,9 @@ pub const NORMALIZE_1: &str = r#"WITH missing AS MATERIALIZED (SELECT frame.dedu
              FROM missing
              JOIN sync_events e ON e.dedupe_key = missing.dedupe_key
              WHERE e.stream_name = 'wireless.audit'
-             ON CONFLICT (dedupe_key) DO NOTHING"#;
+             ON CONFLICT (dedupe_key) DO NOTHING RETURNING dedupe_key)
+           UPDATE wireless_frames frame SET updated_at = clock_timestamp()
+           FROM inserted WHERE frame.dedupe_key = inserted.dedupe_key"#;
 
 // Parameters: batchLimit
 pub const NORMALIZE_2: &str = r#"WITH missing AS MATERIALIZED (SELECT frame.dedupe_key

@@ -85,9 +85,30 @@ func (s *Store) Snapshot(ctx context.Context) ([]byte, error) {
 // Health reports store reachability for the operator endpoint. It never
 // gates process readiness.
 func (s *Store) Health(ctx context.Context) (redisOK, minioOK bool) {
-	redisOK = s.redis.Ping(ctx) == nil
-	if ok, err := s.objects.BucketExists(ctx, s.bucket); err == nil && ok {
-		minioOK = true
+	redisResult, minioResult := make(chan bool, 1), make(chan bool, 1)
+	go func(result chan<- bool) { result <- s.redis.Ping(ctx) == nil }(redisResult)
+	go func(result chan<- bool) {
+		ok, err := s.objects.BucketExists(ctx, s.bucket)
+		result <- err == nil && ok
+	}(minioResult)
+	for redisResult != nil || minioResult != nil {
+		select {
+		case redisOK = <-redisResult:
+			redisResult = nil
+		case minioOK = <-minioResult:
+			minioResult = nil
+		case <-ctx.Done():
+			// Keep results that arrived before the deadline.
+			select {
+			case redisOK = <-redisResult:
+			default:
+			}
+			select {
+			case minioOK = <-minioResult:
+			default:
+			}
+			return redisOK, minioOK
+		}
 	}
 	return redisOK, minioOK
 }

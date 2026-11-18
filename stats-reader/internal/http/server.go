@@ -3,9 +3,11 @@
 package httpsrv
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"time"
 )
@@ -170,8 +172,13 @@ func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request) bool {
 // that are absent stay absent; values are never invented.
 func sanitizeSnapshot(raw []byte) ([]byte, error) {
 	var top map[string]any
-	if err := json.Unmarshal(raw, &top); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&top); err != nil {
 		return nil, err
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return nil, errors.New("snapshot contains trailing data")
 	}
 	out := make(map[string]any, len(topLevelKeys))
 	for _, k := range topLevelKeys {
@@ -181,13 +188,21 @@ func sanitizeSnapshot(raw []byte) ([]byte, error) {
 		}
 		switch k {
 		case "liveStrip":
-			out[k] = filterObject(v, liveStripKeys)
+			if filtered, ok := filterObject(v, liveStripKeys); ok {
+				out[k] = filtered
+			}
 		case "lifetimeTotals":
-			out[k] = filterObject(v, lifetimeTotalsKeys)
+			if filtered, ok := filterObject(v, lifetimeTotalsKeys); ok {
+				out[k] = filtered
+			}
 		case "throughput24h", "throughput7d":
-			out[k] = filterThroughput(v)
+			if filtered, ok := filterThroughput(v); ok {
+				out[k] = filtered
+			}
 		default:
-			out[k] = v
+			if validLeaf(k, v) {
+				out[k] = v
+			}
 		}
 	}
 	asOf, ok := out["asOf"].(string)
@@ -197,26 +212,49 @@ func sanitizeSnapshot(raw []byte) ([]byte, error) {
 	return json.Marshal(out)
 }
 
-// filterObject keeps only allowlisted keys of a JSON object. Non-objects
-// (including null) pass through unchanged.
-func filterObject(v any, allowed []string) any {
+// filterObject keeps allowlisted, correctly typed fields and preserves null.
+func filterObject(v any, allowed []string) (any, bool) {
+	if v == nil {
+		return nil, true
+	}
 	m, ok := v.(map[string]any)
 	if !ok {
-		return v
+		return nil, false
 	}
 	out := make(map[string]any, len(allowed))
 	for _, k := range allowed {
-		if nv, ok := m[k]; ok {
+		if nv, ok := m[k]; ok && validLeaf(k, nv) {
 			out[k] = nv
 		}
 	}
-	return out
+	return out, true
 }
 
-func filterThroughput(v any) any {
+func validLeaf(key string, v any) bool {
+	if v == nil {
+		return true
+	}
+	switch key {
+	case "asOf", "peaksComputedAt", "peakRecordsDayDate", "peakRecordsWeekStart",
+		"peakRecordsWeekEnd", "lastIngestSuccessAt", "computedAt", "bucket", "bucketStart":
+		_, ok := v.(string)
+		return ok
+	case "backpressureActive":
+		_, ok := v.(bool)
+		return ok
+	default:
+		_, ok := v.(json.Number)
+		return ok
+	}
+}
+
+func filterThroughput(v any) (any, bool) {
+	if v == nil {
+		return nil, true
+	}
 	m, ok := v.(map[string]any)
 	if !ok {
-		return v
+		return nil, false
 	}
 	out := make(map[string]any, len(throughputKeys))
 	for _, k := range throughputKeys {
@@ -225,22 +263,31 @@ func filterThroughput(v any) any {
 			continue
 		}
 		if k == "series" {
-			out[k] = filterSeries(nv)
+			if series, ok := filterSeries(nv); ok {
+				out[k] = series
+			}
 			continue
 		}
-		out[k] = nv
+		if validLeaf(k, nv) {
+			out[k] = nv
+		}
 	}
-	return out
+	return out, true
 }
 
-func filterSeries(v any) any {
+func filterSeries(v any) (any, bool) {
+	if v == nil {
+		return nil, true
+	}
 	arr, ok := v.([]any)
 	if !ok {
-		return v
+		return nil, false
 	}
 	out := make([]any, 0, len(arr))
 	for _, item := range arr {
-		out = append(out, filterObject(item, seriesItemKeys))
+		if filtered, ok := filterObject(item, seriesItemKeys); ok {
+			out = append(out, filtered)
+		}
 	}
-	return out
+	return out, true
 }

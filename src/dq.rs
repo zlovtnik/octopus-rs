@@ -13,6 +13,8 @@ use serde_json::{json, Value};
 use std::{collections::BTreeSet, str::FromStr};
 
 pub const DISPATCH_PAGE_BYTES: usize = 1024 * 1024;
+const RECORD_BYTES: usize = 65_536;
+pub(crate) const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{code}")]
@@ -115,55 +117,100 @@ fn canonical_number(value: &Value) -> Result<String> {
     Ok(number.to_plain_string())
 }
 
-fn write_canonical(value: &Value, depth: usize, output: &mut String) -> Result<()> {
+fn append(output: &mut String, text: &str, limit: usize) -> Result<()> {
+    if text.len() > limit.saturating_sub(output.len()) {
+        return Err(DqError::new(413, "record_too_large"));
+    }
+    output.push_str(text);
+    Ok(())
+}
+
+fn write_string(value: &str, output: &mut String, limit: usize) -> Result<()> {
+    if value.len().saturating_add(2) > limit.saturating_sub(output.len()) {
+        return Err(DqError::new(413, "record_too_large"));
+    }
+    append(output, "\"", limit)?;
+    let mut start = 0;
+    for (index, character) in value.char_indices() {
+        let escaped = match character {
+            '"' => r#"\""#,
+            '\\' => r"\\",
+            '\u{08}' => r"\b",
+            '\u{0c}' => r"\f",
+            '\n' => r"\n",
+            '\r' => r"\r",
+            '\t' => r"\t",
+            '\u{2028}' => r"\u2028",
+            '\u{2029}' => r"\u2029",
+            character if character <= '\u{1f}' => {
+                append(output, &value[start..index], limit)?;
+                append(output, &format!("\\u{:04x}", u32::from(character)), limit)?;
+                start = index + 1;
+                continue;
+            }
+            _ => continue,
+        };
+        append(output, &value[start..index], limit)?;
+        append(output, escaped, limit)?;
+        start = index + character.len_utf8();
+    }
+    append(output, &value[start..], limit)?;
+    append(output, "\"", limit)
+}
+
+fn write_canonical(value: &Value, depth: usize, output: &mut String, limit: usize) -> Result<()> {
     if depth > 128 {
         return Err(DqError::new(400, "json_depth_exceeded"));
     }
     match value {
-        Value::Number(_) => output.push_str(&canonical_number(value)?),
+        Value::Number(_) => append(output, &canonical_number(value)?, limit)?,
+        Value::String(value) => write_string(value, output, limit)?,
         Value::Array(values) => {
-            output.push('[');
+            append(output, "[", limit)?;
             for (index, item) in values.iter().enumerate() {
                 if index != 0 {
-                    output.push(',');
+                    append(output, ",", limit)?;
                 }
-                write_canonical(item, depth + 1, output)?;
+                write_canonical(item, depth + 1, output, limit)?;
             }
-            output.push(']');
+            append(output, "]", limit)?;
         }
         Value::Object(values) => {
-            output.push('{');
+            append(output, "{", limit)?;
+            if values.len() > limit.saturating_sub(output.len()) / 5 {
+                return Err(DqError::new(413, "record_too_large"));
+            }
             let mut entries: Vec<_> = values.iter().collect();
             // UTF-8 lexicographic ordering has the same order as Unicode
             // scalar values, unlike Java's default UTF-16 String ordering.
             entries.sort_by_key(|(key, _)| *key);
             for (index, (key, item)) in entries.into_iter().enumerate() {
                 if index != 0 {
-                    output.push(',');
+                    append(output, ",", limit)?;
                 }
-                output.push_str(
-                    &serde_json::to_string(key).expect("string serialization is infallible"),
-                );
-                output.push(':');
-                write_canonical(item, depth + 1, output)?;
+                write_string(key, output, limit)?;
+                append(output, ":", limit)?;
+                write_canonical(item, depth + 1, output, limit)?;
             }
-            output.push('}');
+            append(output, "}", limit)?;
         }
-        _ => output.push_str(&value.to_string()),
+        _ => append(output, &value.to_string(), limit)?,
     }
     Ok(())
 }
 
 pub fn canonical(value: &Value) -> Result<String> {
+    canonical_with_limit(value, MAX_ARTIFACT_BYTES)
+}
+
+pub(crate) fn canonical_with_limit(value: &Value, limit: usize) -> Result<String> {
     let mut output = String::new();
-    write_canonical(value, 0, &mut output)?;
-    Ok(output
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029"))
+    write_canonical(value, 0, &mut output, limit)?;
+    Ok(output)
 }
 
 pub fn sha256(value: &Value) -> Result<String> {
-    Ok(sha256_hex(canonical(value)?))
+    Ok(sha256_hex(canonical_with_limit(value, RECORD_BYTES)?))
 }
 pub fn digest(value: &str) -> String {
     sha256_hex(value)
@@ -235,21 +282,20 @@ pub fn scoped(principal: &DqPrincipal, request: &Value, settings: &DqSettings) -
     Ok(())
 }
 pub fn bounded(value: &Value) -> Result<()> {
-    if canonical(value)?.len() > 65_536 {
-        Err(DqError::new(413, "record_too_large"))
-    } else {
-        Ok(())
-    }
+    canonical_with_limit(value, RECORD_BYTES).map(drop)
 }
 
 /// Clock is explicit for deterministic admission tests. Java's extreme Instant
 /// range beyond PostgreSQL/Chrono remains an explicit compatibility boundary.
 pub fn deadline(request: &Value, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
-    match optional(request, "deadline_at") {
+    match request.get("deadline_at") {
         None => now
             .checked_add_signed(Duration::seconds(3600))
             .ok_or_else(|| DqError::new(400, "invalid_deadline")),
-        Some(value) => instant::parse(value).map_err(|_| DqError::new(400, "invalid_deadline")),
+        Some(value) => value
+            .as_str()
+            .and_then(|value| instant::parse(value).ok())
+            .ok_or_else(|| DqError::new(400, "invalid_deadline")),
     }
 }
 

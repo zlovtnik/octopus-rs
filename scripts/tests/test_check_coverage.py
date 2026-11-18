@@ -69,6 +69,7 @@ class CoverageTest(unittest.TestCase):
                 if change == "domain":
                     self.data["domains"]["config"]["minimum_line_percentage"] = 51
                 else:
+                    self.data["domains"]["config"]["minimum_line_percentage"] = 50
                     self.data["overall_minimum_line_percentage"] = 51
                 self.write_policy()
                 self.assertEqual(1, self.check())

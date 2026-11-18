@@ -185,7 +185,10 @@ class CoverageRunnerTest(unittest.TestCase):
 
 class RealProductionCoverageTest(unittest.TestCase):
     def test_pinned_toolchain_excludes_inline_tests_but_keeps_production_hits(self) -> None:
-        available = subprocess.run(["rustup", "toolchain", "list"], text=True, capture_output=True)
+        try:
+            available = subprocess.run(["rustup", "toolchain", "list"], text=True, capture_output=True)
+        except FileNotFoundError:
+            self.skipTest("rustup is unavailable for the real compiler fixture")
         if available.returncode or not any(line.startswith("1.100.0-") for line in available.stdout.splitlines()):
             self.skipTest("Rust 1.100.0 is unavailable for the real compiler fixture")
         with tempfile.TemporaryDirectory(prefix="octopus-production-coverage-") as directory:

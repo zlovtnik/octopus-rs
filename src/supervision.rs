@@ -357,9 +357,6 @@ impl Supervisor {
                 return;
             };
             if matches!(error, WorkloadError::Terminal(_)) {
-                let _ = self
-                    .finish_run(&run_id, "failed_terminal", Some(&error))
-                    .await;
                 // A failed status write must not leave in-memory readiness green.
                 let status = ProcessorStatus {
                     lifecycle: ProcessorLifecycle::FailedTerminal,
@@ -370,11 +367,11 @@ impl Supervisor {
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(workload.id, status.clone());
+                let _ = self.finish_run(&run_id, "failed_terminal", Some(&error)).await;
                 let _ = self.persist_status(workload.id, status).await;
                 stop.cancelled().await;
                 return;
             }
-            let _ = self.finish_run(&run_id, "retrying", Some(&error)).await;
             if started.elapsed() >= Duration::from_millis(self.config.restart_max_delay_ms as u64) {
                 restarts = 0;
             }
@@ -388,6 +385,7 @@ impl Supervisor {
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(workload.id, status.clone());
+            let _ = self.finish_run(&run_id, "retrying", Some(&error)).await;
             let _ = self.persist_status(workload.id, status).await;
             tokio::select! {_=stop.cancelled()=>return,_=tokio::time::sleep(retry.delay(workload.id,restarts))=>{}}
         }
@@ -438,7 +436,7 @@ impl LeaseStore {
         let token = uuid::Uuid::new_v4().to_string();
         let mut tx = self.runtime.begin_worker().await?;
         tx.execute("INSERT INTO work_leases(resource_type,resource_id) VALUES($1,$2) ON CONFLICT(resource_type,resource_id) DO UPDATE SET resource_id=EXCLUDED.resource_id",&[&resource_type,&resource_id]).await?;
-        let rows=tx.query("UPDATE work_leases SET owner_id=$3,lease_token=$4,fence=fence+1,attempt_count=attempt_count+1,lease_expires_at=CURRENT_TIMESTAMP+$5*INTERVAL '1 second',last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE resource_type=$1 AND resource_id=$2 AND (next_attempt_at IS NULL OR next_attempt_at<=CURRENT_TIMESTAMP) AND (lease_expires_at IS NULL OR lease_expires_at<=CURRENT_TIMESTAMP) RETURNING fence,lease_expires_at",&[&resource_type,&resource_id,&owner,&token,&f64::from(ttl.max(1))]).await?;
+        let rows=tx.query("WITH sampled AS MATERIALIZED (SELECT clock_timestamp() AS now) UPDATE work_leases SET owner_id=$3,lease_token=$4,fence=fence+1,attempt_count=attempt_count+1,lease_expires_at=sampled.now+$5*INTERVAL '1 second',last_error=NULL,updated_at=sampled.now FROM sampled WHERE resource_type=$1 AND resource_id=$2 AND (next_attempt_at IS NULL OR next_attempt_at<=sampled.now) AND (lease_expires_at IS NULL OR lease_expires_at<=sampled.now) RETURNING fence,lease_expires_at",&[&resource_type,&resource_id,&owner,&token,&f64::from(ttl.max(1))]).await?;
         let lease = rows.first().map(|r| Lease {
             scope: format!("{resource_type}/{resource_id}"),
             owner_id: owner.into(),
@@ -479,7 +477,7 @@ impl LeaseStore {
         resource_id: &str,
         lease: &Lease,
     ) -> Result<bool, PgError> {
-        Ok(!tx.query("SELECT 1 FROM work_leases WHERE resource_type=$1 AND resource_id=$2 AND owner_id=$3 AND lease_token=$4 AND fence=$5 AND lease_expires_at>CURRENT_TIMESTAMP FOR UPDATE",&[&resource_type,&resource_id,&lease.owner_id,&lease.token,&lease.fence]).await?.is_empty())
+        Ok(!tx.query("WITH fenced AS MATERIALIZED (SELECT lease_expires_at FROM work_leases WHERE resource_type=$1 AND resource_id=$2 AND owner_id=$3 AND lease_token=$4 AND fence=$5 FOR UPDATE) SELECT 1 FROM fenced WHERE lease_expires_at>clock_timestamp()",&[&resource_type,&resource_id,&lease.owner_id,&lease.token,&lease.fence]).await?.is_empty())
     }
     pub async fn run_fenced<T: Send>(
         &self,
@@ -494,7 +492,7 @@ impl LeaseStore {
         };
         let renew = async {
             loop {
-                tokio::time::sleep(Duration::from_secs((ttl.max(1) as u64 / 3).max(1))).await;
+                tokio::time::sleep(Duration::from_secs(ttl.max(1) as u64) / 3).await;
                 if !self.renew("processor", id.as_str(), &lease, ttl).await? {
                     return Err(WorkloadError::Retryable("processor lease was lost".into()));
                 }

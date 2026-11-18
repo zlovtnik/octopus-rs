@@ -58,21 +58,6 @@ impl Fixture {
         let network = format!("{name}-net");
         let directory = tempfile::tempdir().unwrap();
         checked(Command::new("docker").args(["network", "create", &network]));
-        checked(Command::new("docker").args([
-            "run",
-            "-d",
-            "--name",
-            &name,
-            "--network",
-            &network,
-            "-e",
-            "POSTGRES_PASSWORD=integration-admin",
-            "-e",
-            "POSTGRES_DB=sync",
-            "-p",
-            "127.0.0.1::5432",
-            IMAGE,
-        ]));
         // The cleanup guard exists before connectivity/provisioning assertions.
         struct Cleanup {
             name: String,
@@ -96,6 +81,21 @@ impl Fixture {
             network: network.clone(),
             armed: true,
         };
+        checked(Command::new("docker").args([
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "--network",
+            &network,
+            "-e",
+            "POSTGRES_PASSWORD=integration-admin",
+            "-e",
+            "POSTGRES_DB=sync",
+            "-p",
+            "127.0.0.1::5432",
+            IMAGE,
+        ]));
         let mut ready = false;
         for _ in 0..120 {
             if Command::new("docker")

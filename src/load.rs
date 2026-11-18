@@ -79,17 +79,17 @@ impl LoadStore {
 
     /// Authorization is deliberately outside the error-to-result boundary.
     pub async fn handle(&self, load: &SyncLoad) -> Result<PostgresResult, LoadError> {
-        self.authorize(load).await?;
-        let finished = Utc::now().to_rfc3339();
+        let mut tx = self.runtime.begin_worker().await?;
+        authorize_load(&mut tx, load).await?;
+        let recorded = lock_attempt(&mut tx, load).await?;
+        tx.commit().await?;
+        if let Some(result) = recorded {
+            return Ok(result);
+        }
         let outcome = self.handle_authorized(load).await;
         Ok(match outcome {
-            Ok((count, sum)) => PostgresResult::success(
-                load.job_id.clone(),
-                load.batch_id.clone(),
-                count,
-                sum,
-                finished,
-            ),
+            Ok(result) => result,
+            Err(error) if error.is_unauthorized() => return Err(error),
             Err(error) => PostgresResult::failure(
                 load.job_id.clone(),
                 load.batch_id.clone(),
@@ -100,12 +100,12 @@ impl LoadStore {
                 }
                 .into(),
                 crate::errors::message(&error),
-                finished,
+                Utc::now().to_rfc3339(),
             ),
         })
     }
 
-    async fn handle_authorized(&self, load: &SyncLoad) -> Result<(i32, String), LoadError> {
+    async fn handle_authorized(&self, load: &SyncLoad) -> Result<PostgresResult, LoadError> {
         if self.chunk_rows == 0 || self.chunk_bytes == 0 {
             return Err(LoadError::Invalid("chunk bounds must be positive"));
         }
@@ -136,9 +136,13 @@ impl LoadStore {
         load: &SyncLoad,
         target: SinkTarget,
         payload: &str,
-    ) -> Result<(i32, String), LoadError> {
+    ) -> Result<PostgresResult, LoadError> {
         let mut rows = PayloadRows::new(target, payload, self.chunk_bytes)?;
         let mut tx = self.runtime.begin_worker().await?;
+        if let Some(result) = lock_attempt(&mut tx, load).await? {
+            tx.commit().await?;
+            return Ok(result);
+        }
         let mut count = 0i64;
         loop {
             let mut chunk = Vec::new();
@@ -172,8 +176,16 @@ impl LoadStore {
                 return Err(LoadError::Invalid("inserted row count exceeds i32 limit"));
             }
         }
+        let result = PostgresResult::success(
+            load.job_id.clone(),
+            load.batch_id.clone(),
+            count as i32,
+            checksum(target, payload),
+            Utc::now().to_rfc3339(),
+        );
+        enqueue_result(&mut tx, &result, load.attempt).await?;
         tx.commit().await?;
-        Ok((count as i32, checksum(target, payload)))
+        Ok(result)
     }
 
     pub async fn resolve_payload(&self, reference: &str) -> Result<String, LoadError> {
@@ -371,12 +383,36 @@ pub fn resolve_local_payload(
                 LoadError::PayloadRead
             }
         };
-        let base = outbox_dir.canonicalize().map_err(io_error)?;
-        let path = base.join(normalized).canonicalize().map_err(io_error)?;
-        if !path.starts_with(base) {
-            return Err(LoadError::Invalid("outbox path escapes base"));
+        use rustix::fs::{open, openat, Mode, OFlags};
+        use std::io::Read;
+
+        let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let mut parent =
+            open(outbox_dir, directory, Mode::empty()).map_err(|e| io_error(e.into()))?;
+        let mut components = normalized.iter().peekable();
+        while let Some(component) = components.next() {
+            if components.peek().is_some() {
+                parent = openat(
+                    &parent,
+                    component,
+                    directory | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map_err(|e| io_error(e.into()))?;
+            } else {
+                let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+                let fd = openat(&parent, component, flags, Mode::empty())
+                    .map_err(|e| io_error(e.into()))?;
+                let mut file = std::fs::File::from(fd);
+                if !file.metadata().map_err(io_error)?.is_file() {
+                    return Err(LoadError::Invalid("outbox payload must be a regular file"));
+                }
+                let mut payload = String::new();
+                file.read_to_string(&mut payload).map_err(io_error)?;
+                return Ok(payload);
+            }
         }
-        return std::fs::read_to_string(path).map_err(io_error);
+        return Err(LoadError::Invalid("outbox payload must be a regular file"));
     }
     Err(LoadError::Invalid("unsupported payload_ref scheme"))
 }
@@ -396,6 +432,38 @@ pub(crate) async fn authorize_load(
         return Err(LoadError::Unauthorized("load"));
     }
     Ok(())
+}
+
+async fn lock_attempt(
+    tx: &mut PgTransaction,
+    load: &SyncLoad,
+) -> Result<Option<PostgresResult>, LoadError> {
+    let batch = tx.query(
+        "SELECT status,attempt_count FROM sync_batches WHERE batch_id=$1 AND job_id=$2 FOR UPDATE",
+        &[&load.batch_id, &load.job_id],
+    ).await?;
+    let batch = batch.first().ok_or(LoadError::Unauthorized("load"))?;
+    let key = format!("{}:{}", load.batch_id, load.attempt);
+    let results = tx.query(
+        "SELECT payload::text FROM outbox_events WHERE destination_topic='sync.oracle.result' AND event_type='sync.load.result' AND message_key=$1",
+        &[&key],
+    ).await?;
+    if let Some(result) = results.first() {
+        let result: PostgresResult = serde_json::from_str(&result.get::<_, String>(0))
+            .map_err(|_| LoadError::Invariant("malformed stored load result"))?;
+        if result.job_id != load.job_id || result.batch_id != load.batch_id || results.len() != 1 {
+            return Err(LoadError::Invariant("stored load result identity mismatch"));
+        }
+        return Ok(Some(result));
+    }
+    let status: String = batch.get(0);
+    let attempt: i32 = batch.get(1);
+    if !matches!(status.as_str(), "pending" | "dispatched" | "running")
+        || load.attempt != attempt.saturating_add(i32::from(status == "pending"))
+    {
+        return Err(LoadError::Unauthorized("load"));
+    }
+    Ok(None)
 }
 async fn authorize_result(
     tx: &mut PgTransaction,
@@ -458,7 +526,7 @@ async fn persist_evidence(
     if !verify_evidence(tx, m, key).await? {
         return Err(LoadError::Invariant("evidence disappeared after upsert"));
     }
-    tx.execute("INSERT INTO consumer_offsets(group_id,topic,partition_id,next_offset,group_version,artifact_sha256,updated_at) VALUES($1,$2,$3,$4,$5,$6,CURRENT_TIMESTAMP) ON CONFLICT(group_id,topic,partition_id) DO UPDATE SET next_offset=GREATEST(consumer_offsets.next_offset,EXCLUDED.next_offset),group_version=EXCLUDED.group_version,artifact_sha256=EXCLUDED.artifact_sha256,updated_at=CURRENT_TIMESTAMP",&[&m.consumer_group,&m.topic,&m.partition,&m.offset.wrapping_add(1),&m.group_version.to_string(),&m.artifact_sha256]).await?;
+    tx.execute("INSERT INTO consumer_offsets(group_id,topic,partition_id,next_offset,group_version,artifact_sha256,updated_at) VALUES($1,$2,$3,$4,$5,$6,CURRENT_TIMESTAMP) ON CONFLICT(group_id,topic,partition_id) DO UPDATE SET next_offset=GREATEST(consumer_offsets.next_offset,EXCLUDED.next_offset),group_version=CASE WHEN EXCLUDED.next_offset>consumer_offsets.next_offset THEN EXCLUDED.group_version ELSE consumer_offsets.group_version END,artifact_sha256=CASE WHEN EXCLUDED.next_offset>consumer_offsets.next_offset THEN EXCLUDED.artifact_sha256 ELSE consumer_offsets.artifact_sha256 END,updated_at=CURRENT_TIMESTAMP",&[&m.consumer_group,&m.topic,&m.partition,&m.offset.wrapping_add(1),&m.group_version.to_string(),&m.artifact_sha256]).await?;
     Ok(())
 }
 async fn enqueue_result(
@@ -510,7 +578,10 @@ async fn apply_result(
         return Err(LoadError::Invariant("result attempt is ahead of batch"));
     }
     if r.status == "success" {
-        let changed=tx.execute("UPDATE sync_batches SET status='completed',row_count=$3,checksum=$4,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE batch_id=$1 AND job_id=$2 AND status IN ('pending','dispatched','running')",&[&r.batch_id,&r.job_id,&r.row_count,&r.checksum]).await?;
+        let changed = tx.execute(
+            "UPDATE sync_batches SET status='completed',attempt_count=$5,row_count=$3,checksum=$4,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE batch_id=$1 AND job_id=$2 AND status IN ('pending','dispatched','running')",
+            &[&r.batch_id, &r.job_id, &r.row_count, &r.checksum, &attempt],
+        ).await?;
         if changed != 1 {
             return Err(LoadError::Invariant("cannot complete batch"));
         }
@@ -524,14 +595,20 @@ async fn apply_result(
                 &[&stream],
             )
             .await?;
-        let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        if current
-            .first()
-            .is_some_and(|r| numeric(&r.get::<_, String>(0)) != numeric(&end))
+        let numeric = |s: &str| {
+            let digits = s.strip_prefix('-').unwrap_or(s);
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        };
+        let epoch = stream == "wireless.audit";
+        if epoch
+            && (!numeric(&end)
+                || current
+                    .first()
+                    .is_some_and(|r| !numeric(&r.get::<_, String>(0))))
         {
             return Err(LoadError::Invalid("cursor format mismatch"));
         }
-        tx.execute("INSERT INTO sync_cursors(stream_name,cursor_value,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP) ON CONFLICT(stream_name) DO UPDATE SET cursor_value=CASE WHEN EXCLUDED.cursor_value ~ '^[0-9]+$' AND EXCLUDED.cursor_value::decimal(65,0)>sync_cursors.cursor_value::decimal(65,0) THEN EXCLUDED.cursor_value WHEN NOT(EXCLUDED.cursor_value ~ '^[0-9]+$') AND EXCLUDED.cursor_value>sync_cursors.cursor_value THEN EXCLUDED.cursor_value ELSE sync_cursors.cursor_value END,updated_at=CURRENT_TIMESTAMP",&[&stream,&end]).await?;
+        tx.execute("INSERT INTO sync_cursors(stream_name,cursor_value,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP) ON CONFLICT(stream_name) DO UPDATE SET cursor_value=CASE WHEN $3::boolean AND EXCLUDED.cursor_value::numeric>sync_cursors.cursor_value::numeric THEN EXCLUDED.cursor_value WHEN NOT($3::boolean) AND (sync_cursors.cursor_value='0' OR EXCLUDED.cursor_value>sync_cursors.cursor_value) THEN EXCLUDED.cursor_value ELSE sync_cursors.cursor_value END,updated_at=CURRENT_TIMESTAMP",&[&stream,&end,&epoch]).await?;
     } else if r.retryable && attempt < max {
         let changed=tx.execute("UPDATE sync_batches SET status='pending',attempt_count=attempt_count+CASE WHEN status='pending' THEN 1 ELSE 0 END,last_error=$3,updated_at=CURRENT_TIMESTAMP WHERE batch_id=$1 AND job_id=$2 AND status IN ('pending','dispatched','running')",&[&r.batch_id,&r.job_id,&r.error_text]).await?;
         if changed != 1 {

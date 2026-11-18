@@ -2,10 +2,22 @@ package validate
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/zlovtnik/ssl-proxy/services/platform-sync/internal/contract"
 )
+
+const userlistToken = `"(?:[^"]|"")*"|[^"\s]+`
+
+var userlistLine = regexp.MustCompile(`^(` + userlistToken + `)\s+(` + userlistToken + `)$`)
+
+func userlistField(field string) string {
+	if strings.HasPrefix(field, "\"") {
+		return strings.ReplaceAll(field[1:len(field)-1], "\"\"", "\"")
+	}
+	return field
+}
 
 func validatePgBouncer(c *contract.Contract, data map[string]map[string][]byte) error {
 	if err := validateServerTLS(
@@ -33,12 +45,12 @@ func validatePgBouncer(c *contract.Contract, data map[string]map[string][]byte) 
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
+		parts := userlistLine.FindStringSubmatch(line)
+		if parts == nil {
 			return fmt.Errorf("PgBouncer userlist line %d: invalid format", i+1)
 		}
-		username := strings.Trim(parts[0], "\"")
-		password := strings.Trim(parts[1], "\"")
+		username := userlistField(parts[1])
+		password := userlistField(parts[2])
 		if username == "" || password == "" {
 			return fmt.Errorf("PgBouncer userlist line %d: empty username or password", i+1)
 		}

@@ -417,3 +417,18 @@ func TestSanitizeRejectsMissingAsOf(t *testing.T) {
 		t.Fatal("sanitizeSnapshot accepted non-JSON")
 	}
 }
+
+func TestSnapshotPreservesLargeNumbersAndDropsInvalidFieldShapes(t *testing.T) {
+	raw := []byte(`{"asOf":"2026-11-18T00:00:00Z","peakRecordsDay":9007199254740993,"peakRecordsWeek":{"hostname":"hidden"},"liveStrip":[{"hostname":"hidden"}],"lifetimeTotals":null,"throughput24h":{"bucket":"hour","series":[["hidden"],{"bucketStart":"00:00","records":null,"hostname":"hidden"},null]}}`)
+	got, err := sanitizeSnapshot(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"asOf":"2026-11-18T00:00:00Z","lifetimeTotals":null,"peakRecordsDay":9007199254740993,"throughput24h":{"bucket":"hour","series":[{"bucketStart":"00:00","records":null},null]}}`
+	if string(got) != want {
+		t.Fatalf("snapshot = %s, want %s", got, want)
+	}
+	if _, err := sanitizeSnapshot(append(raw, []byte(" null")...)); err == nil {
+		t.Fatal("snapshot accepted a trailing JSON value")
+	}
+}

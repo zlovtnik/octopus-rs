@@ -22,7 +22,7 @@ pipeline {
     stage('Validate delivery scaffold') {
       steps {
         script {
-          env.OCTOPUS_RUST_DIR = fileExists('services/octopus-rust/Jenkinsfile') ? 'services/octopus-rust' : '.'
+          env.OCTOPUS_RUST_DIR = fileExists('services/octopus-rs/Jenkinsfile') ? 'services/octopus-rs' : '.'
         }
         dir(env.OCTOPUS_RUST_DIR) {
           sh 'bash scripts/ci/test.sh'

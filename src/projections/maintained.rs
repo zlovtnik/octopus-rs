@@ -26,6 +26,7 @@ impl ProjectionStore {
     }
     pub async fn project_wireless_inventory(&self, limit: i32) -> Result<i32, ProjectionError> {
         let mut tx = self.runtime.begin_worker().await?;
+        tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", &[]).await?;
         let mut total = 0;
         // Selection, additive client counts and marking share a serialization
         // point so competing instances cannot count one input twice.

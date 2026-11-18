@@ -11,17 +11,19 @@ import (
 
 	"github.com/zlovtnik/ssl-proxy/services/platform-sync/internal/contract"
 	"github.com/zlovtnik/ssl-proxy/services/platform-sync/internal/log"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 type fakeObjectClient struct {
-	objects  map[string]*unstructured.Unstructured
-	updates  []fakeUpdate
-	failName string
-	failed   bool
-	nextRV   int
+	objects         map[string]*unstructured.Unstructured
+	updates         []fakeUpdate
+	failName        string
+	failed          bool
+	failAfterUpdate bool
+	nextRV          int
 }
 
 type fakeUpdate struct {
@@ -40,17 +42,82 @@ func (f *fakeObjectClient) Get(_ context.Context, resource schema.GroupVersionRe
 func (f *fakeObjectClient) Update(_ context.Context, resource schema.GroupVersionResource, _ string, obj *unstructured.Unstructured, options metav1.UpdateOptions) (*unstructured.Unstructured, error) {
 	dryRun := len(options.DryRun) > 0
 	f.updates = append(f.updates, fakeUpdate{name: obj.GetName(), dryRun: dryRun})
-	if !dryRun && obj.GetName() == f.failName && !f.failed {
+	key := resource.Resource + "/" + obj.GetName()
+	stored, ok := f.objects[key]
+	if !ok {
+		return nil, apierrors.NewNotFound(resource.GroupResource(), obj.GetName())
+	}
+	if obj.GetResourceVersion() != stored.GetResourceVersion() {
+		return nil, apierrors.NewConflict(resource.GroupResource(), obj.GetName(), errors.New("stale resourceVersion"))
+	}
+	fail := !dryRun && obj.GetName() == f.failName && !f.failed
+	if fail {
 		f.failed = true
-		return nil, errors.New("injected update failure")
+		if !f.failAfterUpdate {
+			return nil, errors.New("injected update failure")
+		}
 	}
 	result := obj.DeepCopy()
 	if !dryRun {
 		f.nextRV++
 		result.SetResourceVersion(fmt.Sprint(f.nextRV))
-		f.objects[resource.Resource+"/"+obj.GetName()] = result.DeepCopy()
+		f.objects[key] = result.DeepCopy()
+	}
+	if fail {
+		return nil, errors.New("injected lost response after update")
 	}
 	return result, nil
+}
+
+type competingLockClient struct {
+	objectClient
+	beforeWrite func()
+}
+
+func (c competingLockClient) Update(ctx context.Context, resource schema.GroupVersionResource, namespace string, obj *unstructured.Unstructured, options metav1.UpdateOptions) (*unstructured.Unstructured, error) {
+	if len(options.DryRun) == 0 {
+		c.beforeWrite()
+	}
+	return c.objectClient.Update(ctx, resource, namespace, obj, options)
+}
+
+func TestCompetingLockAcquisitionsRejectStaleResourceVersion(t *testing.T) {
+	client, contract, _ := writerFixture()
+	ctx := context.Background()
+	logger := log.New()
+	stale, err := client.Get(ctx, configMapResource, contract.Namespace, lockName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both contenders preflight the same version. The second commits before
+	// the first submits its real update.
+	contender := competingLockClient{objectClient: client, beforeWrite: func() {
+		if winner, err := acquireLock(ctx, logger, client, contract.Namespace, 600, false); winner == nil || err != nil {
+			t.Fatalf("competing acquisition = %v, %v", winner, err)
+		}
+	}}
+	if loser, err := acquireLock(ctx, logger, contender, contract.Namespace, 600, false); loser != nil || !apierrors.IsConflict(err) {
+		t.Fatalf("stale acquisition = %v, %v, want a conflict", loser, err)
+	}
+	if _, err := client.Update(ctx, configMapResource, contract.Namespace, stale, metav1.UpdateOptions{DryRun: []string{metav1.DryRunAll}}); !apierrors.IsConflict(err) {
+		t.Fatalf("stale dry-run update error = %v, want a conflict", err)
+	}
+}
+
+func TestWriteAllRollsBackCommittedReadinessWithLostResponse(t *testing.T) {
+	client, c, data := writerFixture()
+	client.failName = c.Readiness.ConfigMapName
+	client.failAfterUpdate = true
+	t.Setenv("SYNC_SNAPSHOT_PATH", filepath.Join(t.TempDir(), "snapshot.json"))
+	if _, err := writeAllWithClient(context.Background(), log.New(), client, c, data, 600, false); err == nil {
+		t.Fatal("lost readiness response was not returned")
+	}
+	for _, name := range []string{"secrets/one", "configmaps/two", "configmaps/platform-ready"} {
+		obj := client.objects[name]
+		if obj.GetAnnotations()[writeIDAnnotation] != "" {
+			t.Fatalf("write to %s was not rolled back", name)
+		}
+	}
 }
 
 func TestWriteAllDryRunPreflightsEveryObjectWithoutMutation(t *testing.T) {

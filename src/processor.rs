@@ -255,10 +255,10 @@ impl ProcessorCatalog {
         &CONTRACTS
     }
     pub fn by_id(id: ProcessorId) -> &'static ProcessorContract {
-        &CONTRACTS[ProcessorId::ALL
+        CONTRACTS
             .iter()
-            .position(|v| *v == id)
-            .expect("all IDs have contracts")]
+            .find(|contract| contract.id == id)
+            .expect("all IDs have contracts")
     }
 }
 static CONTRACTS: [ProcessorContract; 28] = [

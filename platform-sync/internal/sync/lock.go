@@ -24,11 +24,12 @@ type Lock struct {
 	namespace       string
 	holder          string
 	resourceVersion string
+	expiresAt       time.Time
 }
 
 func acquireLock(ctx context.Context, logger *log.Logger, client objectClient, namespace string, ttlSeconds int, dryRun bool) (*Lock, error) {
-	if ttlSeconds <= 0 {
-		return nil, fmt.Errorf("lock TTL must be positive")
+	if ttlSeconds <= 0 || int64(ttlSeconds) > int64((1<<63-1)/time.Second) {
+		return nil, fmt.Errorf("lock TTL is out of range")
 	}
 	existing, err := client.Get(ctx, configMapResource, namespace, lockName, metav1.GetOptions{})
 	if err != nil {
@@ -55,20 +56,24 @@ func acquireLock(ctx context.Context, logger *log.Logger, client objectClient, n
 		return nil, fmt.Errorf("set lock holder: %w", err)
 	}
 
-	options := metav1.UpdateOptions{FieldManager: fieldManager}
-	if dryRun {
-		options.DryRun = []string{metav1.DryRunAll}
-	}
-	updated, err := client.Update(ctx, configMapResource, namespace, desired, options)
-	if err != nil {
-		return nil, fmt.Errorf("update lock: %w", err)
+	if _, err := client.Update(ctx, configMapResource, namespace, desired.DeepCopy(), metav1.UpdateOptions{
+		FieldManager: fieldManager, DryRun: []string{metav1.DryRunAll},
+	}); err != nil {
+		return nil, fmt.Errorf("server-side dry-run lock: %w", err)
 	}
 	if dryRun {
 		logger.Info("server-side dry-run accepted for lock")
 		return nil, nil
 	}
+	expiresAt := now.Add(time.Duration(ttlSeconds) * time.Second)
+	acquireCtx, cancel := context.WithDeadline(ctx, expiresAt.Add(-time.Duration(ttlSeconds)*time.Second/3))
+	defer cancel()
+	updated, err := client.Update(acquireCtx, configMapResource, namespace, desired, metav1.UpdateOptions{FieldManager: fieldManager})
+	if err != nil {
+		return nil, fmt.Errorf("update lock: %w", err)
+	}
 	logger.Info("acquired lock", "holder", holder)
-	return &Lock{namespace: namespace, holder: holder, resourceVersion: updated.GetResourceVersion()}, nil
+	return &Lock{namespace: namespace, holder: holder, resourceVersion: updated.GetResourceVersion(), expiresAt: expiresAt}, nil
 }
 
 func activeLock(existing *unstructured.Unstructured, now time.Time) (bool, string, error) {

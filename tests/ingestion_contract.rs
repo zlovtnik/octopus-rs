@@ -518,7 +518,6 @@ async fn canonical_intake_is_atomic_replay_safe_and_monotonic() {
 
     // Two different events racing for one coordinate may never leave an orphan
     // event from the losing transaction behind the winner's durable evidence.
-    let before = count(&runtime, "sync_events").await;
     let left = record("custom.raw", "race-left", "{}", "2026-11-01T00:00:00Z");
     let right = record("custom.raw", "race-right", "{}", "2026-11-01T00:00:00Z");
     let left_meta = metadata(&left, 42);
@@ -527,10 +526,26 @@ async fn canonical_intake_is_atomic_replay_safe_and_monotonic() {
         store.record_scan_request_with_evidence(&left, &left_meta),
         store.record_scan_request_with_evidence(&right, &right_meta),
     );
-    assert!(matches!(
-        (&left_result, &right_result),
-        (Ok(_), Err(IntakeError::Invariant(_))) | (Err(IntakeError::Invariant(_)), Ok(_))
-    ));
-    assert_eq!(count(&runtime, "sync_events").await, before + 1);
+    let (winner, winning_record, loser, winning_meta) = match (left_result, right_result) {
+        (Ok(winner), Err(IntakeError::Invariant(_))) => (winner, &left, &right, &left_meta),
+        (Err(IntakeError::Invariant(_)), Ok(winner)) => (winner, &right, &left, &right_meta),
+        other => panic!("expected one success and one coordinate conflict, got {other:?}"),
+    };
+    assert_eq!(winner.dedupe_key, winning_record.source().dedupe_key());
+    let mut tx = runtime.begin_worker().await.unwrap();
+    let events = tx.query(
+        "SELECT dedupe_key FROM sync_events WHERE stream_name='custom.raw' AND dedupe_key IN ($1,$2)",
+        &[&winner.dedupe_key, &loser.source().dedupe_key()],
+    ).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].get::<_, String>(0), winner.dedupe_key);
+    let evidence = tx.query(
+        "SELECT dedupe_key,payload_sha256 FROM ingestion_evidence WHERE topic=$1 AND partition_id=$2 AND record_offset=42 AND group_id=$3",
+        &[&winning_meta.topic, &winning_meta.partition, &winning_meta.consumer_group],
+    ).await.unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].get::<_, String>(0), winner.dedupe_key);
+    assert_eq!(evidence[0].get::<_, String>(1), winning_meta.payload_sha256);
+    tx.commit().await.unwrap();
     runtime.close();
 }

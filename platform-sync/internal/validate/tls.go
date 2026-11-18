@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"strings"
 
 	"github.com/zlovtnik/ssl-proxy/services/platform-sync/internal/contract"
 )
@@ -18,6 +19,9 @@ func validateTLS(c *contract.Contract, data map[string]map[string][]byte) error 
 }
 
 func validateServerTLS(name, dnsName string, data map[string]map[string][]byte) error {
+	if strings.TrimSpace(dnsName) == "" {
+		return fmt.Errorf("TLS server DNS name is required")
+	}
 	tlsInput, ok := data[name]
 	if !ok {
 		return fmt.Errorf("TLS secret %s not found", name)

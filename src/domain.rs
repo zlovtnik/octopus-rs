@@ -204,7 +204,7 @@ fn is_offset_datetime(value: &str) -> bool {
     };
     if offset != "Z" {
         let parts: Vec<_> = offset[1..].split(':').collect();
-        if !(2..=3).contains(&parts.len())
+        if !(1..=3).contains(&parts.len())
             || parts
                 .iter()
                 .any(|p| p.len() != 2 || !p.bytes().all(|b| b.is_ascii_digit()))
@@ -216,7 +216,7 @@ fn is_offset_datetime(value: &str) -> bool {
             .map(|p| p.parse().unwrap_or(u32::MAX))
             .collect();
         if numbers[0] > 18
-            || numbers[1] > 59
+            || numbers.get(1).is_some_and(|m| *m > 59)
             || numbers.get(2).is_some_and(|s| *s > 59)
             || (numbers[0] == 18 && numbers[1..].iter().any(|v| *v != 0))
         {

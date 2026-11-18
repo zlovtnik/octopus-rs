@@ -155,7 +155,7 @@ async fn canonical_runtime_restarts_records_cancellation_and_rejects_stale_fence
         .unwrap()
         .contains("do-not-retain"));
     stop.cancel();
-    task.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
 
     let leases = LeaseStore::new(runtime.clone());
     let first = leases
@@ -241,7 +241,7 @@ async fn canonical_runtime_restarts_records_cancellation_and_rejects_stale_fence
     .await
     .unwrap();
     stop.cancel();
-    assert!(task.await.unwrap().is_err());
+    assert!(tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().is_err());
     assert!(leases
         .acquire("processor", id.as_str(), "owner-d", 60)
         .await

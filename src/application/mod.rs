@@ -65,7 +65,7 @@ async fn start(config: AppConfig, stop: CancellationToken, tasks: &mut JoinSet<R
     let enabled = selected_processors(&config.processors.enabled, config.runtime.consumers_enabled)?;
     workloads::validate(&enabled)?;
     let db = Arc::new(PgRuntime::connect(&config.postgres).await?);
-    let metrics = Metrics::new()?;
+    let metrics = Metrics::with_rate_window(config.public_stats.rate_window_seconds)?;
     let backpressure = Backpressure::new(
         db.clone(),
         config.cron.ingest_batch_size,
@@ -75,7 +75,6 @@ async fn start(config: AppConfig, stop: CancellationToken, tasks: &mut JoinSet<R
     let ids: Vec<_> = workloads.iter().map(|workload| workload.id).collect();
     select_workloads(&enabled, &ids)?;
     let has_backpressure = enabled.contains(&ProcessorId::SyncJobPlanner);
-    let supervisor = Supervisor::create(config.processors.clone(), enabled, db.clone()).await?;
 
     // Reconcile the durable DQ scope policy before any legacy writes are allowed.
     let dq_store = DqStore::new(db.clone(), config.dq.settings());
@@ -98,7 +97,8 @@ async fn start(config: AppConfig, stop: CancellationToken, tasks: &mut JoinSet<R
     octopus::dispatch::DispatchStore::new(db.clone())
         .ensure_cursors(&config.ingest.stream_names)
         .await?;
-    let listener = TcpListener::bind(([0, 0, 0, 0], config.http.port as u16)).await?;
+    let listener = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, config.http.port as u16)).await?;
+    let supervisor = Supervisor::create(config.processors.clone(), enabled, db.clone()).await?;
     let health = HealthChecks {
         database: {
             let db = db.clone();

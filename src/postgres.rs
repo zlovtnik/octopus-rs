@@ -168,7 +168,7 @@ pub fn schema_problems(
 ) -> Vec<String> {
     let mut errors = Vec::new();
     for table in REQUIRED_TABLES {
-        if !tables.iter().any(|found| found.eq_ignore_ascii_case(table)) {
+        if !tables.iter().any(|found| found == table) {
             errors.push(format!("missing table {table}"));
         }
     }
@@ -373,8 +373,8 @@ impl PgRuntime {
 
     pub async fn validate_schema(&self, manifest: &str) -> Result<(), PgError> {
         let mut transaction = self.begin_worker().await?;
-        let tables = transaction.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'octopus_core'", &[]).await?.iter().map(|row| row.get(0)).collect::<Vec<String>>();
-        let columns = transaction.query("SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'octopus_core'", &[]).await?.iter().map(|row| ((row.get::<_,String>(0).to_lowercase(), row.get::<_,String>(1).to_lowercase()), row.get(2))).collect();
+        let tables = transaction.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'octopus_core' AND table_type = 'BASE TABLE'", &[]).await?.iter().map(|row| row.get(0)).collect::<Vec<String>>();
+        let columns = transaction.query("SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'octopus_core'", &[]).await?.iter().map(|row| ((row.get::<_,String>(0), row.get::<_,String>(1)), row.get(2))).collect();
         let rows = transaction.query("SELECT required_version, applied_version, required_checksum, applied_checksum, ready FROM octopus_core.schema_readiness WHERE domain = $1", &[&"octopus_core"]).await?;
         let readiness = rows.first().map(|row| SchemaReadiness {
             required_version: row.get(0),
@@ -464,8 +464,13 @@ impl PgTransaction {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<Row>, PgError> {
-        match timeout(self.deadline, self.active_client()?.query(sql, params)).await {
-            Ok(Ok(rows)) => Ok(rows),
+        self.active_client()?;
+        self.failed = true;
+        match timeout(self.deadline, self.client()?.query(sql, params)).await {
+            Ok(Ok(rows)) => {
+                self.failed = false;
+                Ok(rows)
+            }
             Ok(Err(error)) => Err(self.query_error(error)),
             Err(_) => {
                 self.discard_after_deadline().await;
@@ -479,8 +484,13 @@ impl PgTransaction {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<u64, PgError> {
-        match timeout(self.deadline, self.active_client()?.execute(sql, params)).await {
-            Ok(Ok(count)) => Ok(count),
+        self.active_client()?;
+        self.failed = true;
+        match timeout(self.deadline, self.client()?.execute(sql, params)).await {
+            Ok(Ok(count)) => {
+                self.failed = false;
+                Ok(count)
+            }
             Ok(Err(error)) => Err(self.query_error(error)),
             Err(_) => {
                 self.discard_after_deadline().await;
@@ -634,6 +644,9 @@ mod tests {
         };
         let runtime = PgRuntime::build(&config).unwrap();
         assert!(runtime.health_check().await);
+        let mut abandoned = runtime.begin_worker().await.unwrap();
+        assert!(timeout(Duration::from_millis(50), abandoned.query("SELECT pg_sleep(3)", &[])).await.is_err());
+        assert!(matches!(abandoned.commit().await, Err(PgError::FailedTransaction)));
         assert!(
             runtime.validate_schema(&"a".repeat(64)).await.is_err(),
             "unprovisioned database must never pass preflight"

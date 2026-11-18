@@ -150,6 +150,9 @@ func TestMetricsAccountRejectsColumnWrites(t *testing.T) {
 				if _, err := admin.Exec(ctx, fmt.Sprintf("ALTER TABLE %s OWNER TO fixture", table.name)); err != nil {
 					t.Fatal(err)
 				}
+				if _, err := admin.Exec(ctx, strings.ReplaceAll(string(fixture), "{{OCTOPUS_METRICS_ACCOUNT}}", "octopus_metrics")); err != nil {
+					t.Fatal(err)
+				}
 				assertReadOnly(t)
 			})
 			if err := validateAccountGrants(ctx, metrics, "octopus_metrics"); err == nil {
@@ -163,6 +166,9 @@ func TestMetricsAccountRejectsColumnWrites(t *testing.T) {
 		}
 		t.Cleanup(func() {
 			if _, err := admin.Exec(ctx, "ALTER SCHEMA octopus_core OWNER TO fixture"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := admin.Exec(ctx, strings.ReplaceAll(string(fixture), "{{OCTOPUS_METRICS_ACCOUNT}}", "octopus_metrics")); err != nil {
 				t.Fatal(err)
 			}
 			assertReadOnly(t)

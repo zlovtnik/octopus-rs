@@ -44,8 +44,8 @@ fn search_normalization_ascii_is_exact_and_unicode_does_not_silently_change_hash
         octopus::compatibility::normalize_search_text("\t\n ").unwrap(),
         ""
     );
-    assert!(octopus::compatibility::normalize_search_text("\u{ff21}").is_err());
-    assert!(octopus::compatibility::normalize_search_text("caf\u{00e9}").is_err());
+    assert_eq!(octopus::compatibility::normalize_search_text("\u{ff21}").unwrap(), "a");
+    assert_eq!(octopus::compatibility::normalize_search_text("Caf\u{00e9}").unwrap(), "caf\u{00e9}");
 }
 
 #[test]
@@ -247,7 +247,9 @@ fn malformed_small_patterns_never_panic_or_bypass_schema_registration() {
         for b in symbols {
             for c in symbols {
                 let pattern = format!("{a}{b}{c}");
-                let _ = java_pattern::compile(&pattern);
+                if java_pattern::compile(&pattern).is_err() {
+                    assert!(dq::check_schema(&json!({"pattern": pattern})).is_err());
+                }
             }
         }
     }

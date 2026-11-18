@@ -14,8 +14,8 @@ pub mod retention;
 pub mod runner;
 pub mod snapshot;
 mod work;
-pub use runner::DqRuntime;
 pub use artifacts::DqArtifacts;
+pub use runner::DqRuntime;
 
 pub type Result<T> = std::result::Result<T, DqError>;
 fn error(status: u16, code: &str) -> DqError {
@@ -25,7 +25,12 @@ fn error(status: u16, code: &str) -> DqError {
     }
 }
 fn database(source: PgError) -> DqError {
-    eprintln!("DQ test diagnostic: {source:?}");
+    tracing::warn!(classification = %crate::postgres::PostgresErrorClass::classify(&source).wire_value(), "DQ database operation failed");
+    if let PgError::Query { source, .. } = &source {
+        if source.code().is_some_and(|code| code.code() == "40001") {
+            return error(503, "serialization_retry");
+        }
+    }
     error(503, "control_unavailable")
 }
 fn role(principal: &DqPrincipal, allowed: &[&str]) -> Result<()> {
@@ -56,8 +61,35 @@ impl DqStore {
     async fn transaction(&self) -> Result<PgTransaction> {
         self.runtime.begin_worker().await.map_err(database)
     }
+    async fn artifact_limits_tx(
+        &self,
+        tx: &mut PgTransaction,
+        run: &str,
+    ) -> Result<(usize, usize)> {
+        let rows = tx.query(
+            "SELECT manifest->'resources' FROM octopus_core.dq_runs WHERE run_id=$1 AND installation_id=$2 AND namespace=$3",
+            &[&run, &self.settings.installation_id, &self.settings.namespace],
+        ).await.map_err(database)?;
+        let resources: Value = rows
+            .first()
+            .ok_or_else(|| error(404, "run_not_found"))?
+            .get(0);
+        let limit = |key| {
+            usize::try_from(dq::long(&resources, key)?)
+                .ok()
+                .filter(|size| *size > 0)
+                .ok_or_else(|| error(400, "invalid_resources"))
+        };
+        Ok((limit("max_input_bytes")?, limit("max_output_bytes")?))
+    }
+    async fn artifact_limits(&self, run: &str) -> Result<(usize, usize)> {
+        let mut tx = self.transaction().await?;
+        let limits = self.artifact_limits_tx(&mut tx, run).await?;
+        tx.commit().await.map_err(database)?;
+        Ok(limits)
+    }
     async fn run_tx(&self, tx: &mut PgTransaction, run: &str) -> Result<Value> {
-        let rows = tx.query("SELECT r.document || jsonb_build_object('run_id',r.run_id,'status',r.status,'state_revision',r.state_revision,'input_refs',r.input_refs,'output_refs',r.output_refs,'source_revision_digest',r.source_revision_digest,'execution_mode',r.execution_mode,'created_at',r.created_at,'deadline_at',r.deadline_at,'completed_at',r.completed_at,'projection_applied',r.projection_applied,'error_code',r.error_code,'summary',r.summary,'current_attempt',(SELECT to_jsonb(a) FROM octopus_core.dq_attempts a WHERE a.attempt_id=r.current_attempt_id)) FROM octopus_core.dq_runs r WHERE r.run_id=$1", &[&run]).await.map_err(database)?;
+        let rows = tx.query("SELECT r.document || jsonb_build_object('installation_id',r.installation_id,'namespace',r.namespace,'run_id',r.run_id,'status',r.status,'state_revision',r.state_revision,'input_refs',r.input_refs,'output_refs',r.output_refs,'source_revision_digest',r.source_revision_digest,'execution_mode',r.execution_mode,'created_at',r.created_at,'deadline_at',r.deadline_at,'completed_at',r.completed_at,'projection_applied',r.projection_applied,'error_code',r.error_code,'summary',r.summary,'current_attempt',(SELECT to_jsonb(a) FROM octopus_core.dq_attempts a WHERE a.attempt_id=r.current_attempt_id)) FROM octopus_core.dq_runs r WHERE r.run_id=$1 AND r.installation_id=$2 AND r.namespace=$3", &[&run,&self.settings.installation_id,&self.settings.namespace]).await.map_err(database)?;
         rows.first()
             .map(|row| row.get(0))
             .ok_or_else(|| error(404, "run_not_found"))
@@ -65,8 +97,8 @@ impl DqStore {
     async fn lock_run(&self, tx: &mut PgTransaction, run: &str) -> Result<()> {
         if tx
             .query(
-                "SELECT run_id FROM octopus_core.dq_runs WHERE run_id=$1 FOR UPDATE",
-                &[&run],
+                "SELECT run_id FROM octopus_core.dq_runs WHERE run_id=$1 AND installation_id=$2 AND namespace=$3 FOR UPDATE",
+                &[&run, &self.settings.installation_id, &self.settings.namespace],
             )
             .await
             .map_err(database)?
@@ -137,7 +169,7 @@ impl DqStore {
     ) -> Result<()> {
         let r = self.run_tx(tx, run).await?;
         let a = &r["current_attempt"];
-        self.enqueue(tx,topic,&format!("{}/{}/{}",self.settings.installation_id,self.settings.namespace,run),&json!({"schema_version":1,"event_id":id(),"event_type":kind,"installation_id":self.settings.installation_id,"namespace":self.settings.namespace,"run_id":run,"processor_id":r["processor_id"],"processor_version":r["processor_version"],"state_revision":r["state_revision"],"attempt_id":a["attempt_id"],"fence":a["fence"],"occurred_at":Utc::now().to_rfc3339(),"correlation_id":run,"source_revision_digest":r["source_revision_digest"],"parameters":r["parameters"],"artifacts":r[if matches!(kind,"succeeded"|"failed"){"output_refs"}else{"input_refs"}],"traceparent":r["traceparent"],"tracestate":r["tracestate"],"error_code":r["error_code"]})).await
+        self.enqueue(tx,topic,&format!("{}/{}/{}",self.settings.installation_id,self.settings.namespace,run),&json!({"schema_version":1,"event_id":id(),"event_type":kind,"installation_id":self.settings.installation_id,"namespace":self.settings.namespace,"run_id":run,"processor_id":r["processor_id"],"processor_version":r["processor_version"],"state_revision":r["state_revision"],"attempt_id":a["attempt_id"],"fence":a["fence"],"occurred_at":Utc::now().to_rfc3339(),"correlation_id":run,"source_revision_digest":r["source_revision_digest"],"parameters":if kind=="cancelled"{Value::Null}else{r["parameters"].clone()},"artifacts":r[if matches!(kind,"succeeded"|"failed"){"output_refs"}else{"input_refs"}],"traceparent":r["traceparent"],"tracestate":r["tracestate"],"error_code":r["error_code"]})).await
     }
     pub async fn get_run(&self, p: &DqPrincipal, run: &str) -> Result<Value> {
         role(p, &["viewer", "operator", "admin", "automation", "service"])?;

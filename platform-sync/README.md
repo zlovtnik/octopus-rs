@@ -2,7 +2,7 @@
 
 Host-side Vault-to-Kubernetes secret synchronization for the ssl-proxy production
 stack. This is the platform input writer, separate from Argo CD's workload
-reconciliation. The [input contract](../../cyber-stack/platform-input-contract.yaml)
+reconciliation. The [input contract](../../../cyber-stack/platform-input-contract.yaml)
 declares every object, Vault path and allowed key.
 
 ## Architecture
@@ -216,7 +216,7 @@ systemd credentials. The sync renews the token before reading Vault.
 Use Go 1.25 or newer. Start from the workspace root:
 
 ```bash
-cd services/platform-sync
+cd services/octopus-rs/platform-sync
 go test ./...
 go test -race ./...
 go vet ./...
@@ -237,8 +237,8 @@ against an ephemeral PostgreSQL Testcontainer from the repository root:
 
 ```bash
 python3 -m venv /tmp/platform-sync-postgres-tests
-/tmp/platform-sync-postgres-tests/bin/pip install -r services/platform-sync/tests/requirements.txt
-/tmp/platform-sync-postgres-tests/bin/python services/platform-sync/tests/postgres_grants_test.py
+/tmp/platform-sync-postgres-tests/bin/pip install -r services/octopus-rs/platform-sync/tests/requirements.txt
+/tmp/platform-sync-postgres-tests/bin/python services/octopus-rs/platform-sync/tests/postgres_grants_test.py
 ```
 
 Docker and Go are required. The runner supplies `PLATFORM_SYNC_TEST_POSTGRES_DSN`

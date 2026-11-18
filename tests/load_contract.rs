@@ -127,6 +127,13 @@ async fn thirteen_sinks_authorization_replay_atomicity_and_result_fences() {
             .await
             .unwrap_err()
             .is_unauthorized());
+        let row_count = || async {
+            let mut tx = f.runtime.begin_worker().await.unwrap();
+            let count: i64 = tx.query(&format!("SELECT count(*) FROM {table}"), &[]).await.unwrap()[0].get(0);
+            tx.commit().await.unwrap();
+            count
+        };
+        let before = row_count().await;
         let result = store.handle(&load).await.unwrap();
         assert_eq!(
             result.status, "success",
@@ -135,7 +142,9 @@ async fn thirteen_sinks_authorization_replay_atomicity_and_result_fences() {
         );
         assert_eq!(result.row_count, 1);
         assert_eq!(result.checksum, checksum(target, &payload.to_string()));
+        assert_eq!(row_count().await, before + 1, "first load for {target:?}");
         assert_eq!(store.handle(&load).await.unwrap().status, "success");
+        assert_eq!(row_count().await, before + 1, "replay for {target:?}");
         let m = metadata(
             "sync.oracle.load",
             "octopus-load-postgres-v1",
@@ -190,12 +199,6 @@ async fn thirteen_sinks_authorization_replay_atomicity_and_result_fences() {
             .unwrap()[0]
             .get(0);
         assert_eq!(state, "completed");
-        let count: i64 = tx
-            .query(&format!("SELECT count(*) FROM {table}"), &[])
-            .await
-            .unwrap()[0]
-            .get(0);
-        assert!(count > 0);
         tx.commit().await.unwrap();
     }
     let good = json!({"type":"block","host":"atomic.example","time":TIME,"blocked":true});
@@ -308,9 +311,11 @@ async fn retry_and_terminal_failure_are_attempt_fenced() {
         .unwrap();
     assert_eq!(rows[0].get::<_, String>(0), "pending");
     assert_eq!(rows[0].get::<_, i32>(1), 1);
-    let retry:Value=tx.query("SELECT payload FROM outbox_events WHERE source_type='sync_batch_retry' AND source_id=$1",&[&format!("{}:2",load.batch_id)]).await.unwrap()[0].get(0);
+    let retry_key = format!("{}:2", load.batch_id);
+    let retry_query = "SELECT to_jsonb(o) FROM outbox_events o WHERE source_type='sync_batch_retry' AND source_id=$1";
+    let retry_before: Value = tx.query(retry_query, &[&retry_key]).await.unwrap()[0].get(0);
     tx.commit().await.unwrap();
-    let retry: SyncLoad = serde_json::from_value(retry).unwrap();
+    let retry: SyncLoad = serde_json::from_value(retry_before["payload"].clone()).unwrap();
     assert_eq!(retry.attempt, 2);
     let mut stale = rm.clone();
     stale.offset = 1;
@@ -318,6 +323,11 @@ async fn retry_and_terminal_failure_are_attempt_fenced() {
         .record_result_with_evidence(&failure, &stale)
         .await
         .unwrap();
+    let mut tx = f.runtime.begin_worker().await.unwrap();
+    let retries = tx.query(retry_query, &[&retry_key]).await.unwrap();
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0].get::<_, Value>(0), retry_before);
+    tx.commit().await.unwrap();
     let result = store.handle(&retry).await.unwrap();
     assert_eq!(result.status, "success");
     let key = format!("{}:2", load.batch_id);
@@ -343,6 +353,14 @@ async fn retry_and_terminal_failure_are_attempt_fenced() {
         .record_result_with_evidence(&result, &rm)
         .await
         .unwrap();
+    let mut tx = f.runtime.begin_worker().await.unwrap();
+    let rows = tx.query(
+        "SELECT status,attempt_count FROM sync_batches WHERE batch_id=$1",
+        &[&load.batch_id],
+    ).await.unwrap();
+    assert_eq!(rows[0].get::<_, String>(0), "completed");
+    assert_eq!(rows[0].get::<_, i32>(1), 2);
+    tx.commit().await.unwrap();
     let terminal = seed(
         &f,
         "proxy.events",

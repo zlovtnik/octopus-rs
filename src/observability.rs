@@ -50,6 +50,7 @@ struct Readings {
 }
 #[derive(Clone)]
 pub struct Metrics {
+    rate_window_ms: i64,
     registry: Registry,
     committed: IntCounter,
     pending: IntGauge,
@@ -60,8 +61,14 @@ pub struct Metrics {
     readings: Arc<Mutex<Readings>>,
 }
 impl Metrics {
-    pub fn new() -> Result<Self, prometheus::Error> { Self::at(Utc::now().timestamp_millis()) }
-    fn at(started_ms: i64) -> Result<Self, prometheus::Error> {
+    pub fn new() -> Result<Self, prometheus::Error> { Self::with_rate_window(300) }
+    pub fn with_rate_window(seconds: i32) -> Result<Self, prometheus::Error> {
+        Self::at(Utc::now().timestamp_millis(), seconds)
+    }
+    fn at(started_ms: i64, seconds: i32) -> Result<Self, prometheus::Error> {
+        if seconds <= 0 {
+            return Err(prometheus::Error::Msg("public stats rate window must be positive".into()));
+        }
         let registry = Registry::new();
         let committed = IntCounter::new("coordinator_broker_records_committed_total", "Broker records durably handled and successfully committed")?;
         let pending = IntGauge::new("coordinator_pending_ledger_count", "Pending and processing durable ledger entries")?;
@@ -70,16 +77,17 @@ impl Metrics {
         let lifecycle = prometheus::IntGaugeVec::new(Opts::new("coordinator_processor_lifecycle", "Processor lifecycle state"), &["processor"])?;
         let retries = IntCounterVec::new(Opts::new("coordinator_processor_retries_total", "Processor retries"), &["processor"])?;
         for collector in [Box::new(committed.clone()) as Box<dyn prometheus::core::Collector>,Box::new(pending.clone()),Box::new(pressure.clone()),Box::new(last_success.clone()),Box::new(lifecycle.clone()),Box::new(retries.clone())] { registry.register(collector)?; }
-        Ok(Self { registry, committed, pending, pressure, last_success, lifecycle, retries,
+        Ok(Self { rate_window_ms: i64::from(seconds) * 1000, registry, committed, pending, pressure, last_success, lifecycle, retries,
             readings: Arc::new(Mutex::new(Readings { started_ms, ..Readings::default() })) })
     }
-    pub fn broker_committed(&self, count: u64) { self.committed_at(count, Utc::now().timestamp_millis()); }
-    fn committed_at(&self, count: u64, now: i64) {
+    pub fn broker_committed(&self, count: u64) { self.committed_at(count, || Utc::now().timestamp_millis()); }
+    fn committed_at(&self, count: u64, clock: impl FnOnce() -> i64) {
         if count == 0 { return; }
         self.committed.inc_by(count);
         let mut r = self.readings.lock().unwrap_or_else(|e| e.into_inner());
+        let now = clock().max(r.processed_at);
         r.processed_at = now;
-        while r.committed.front().is_some_and(|(at,_)| now.saturating_sub(*at) >= 300_000) { r.committed.pop_front(); }
+        while r.committed.front().is_some_and(|(at,_)| now.saturating_sub(*at) >= self.rate_window_ms) { r.committed.pop_front(); }
         let second = now.div_euclid(1000) * 1000;
         if let Some((at,n)) = r.committed.back_mut().filter(|(at,_)| *at == second) { let _ = at; *n=n.saturating_add(count); }
         else { r.committed.push_back((second,count)); }
@@ -93,9 +101,11 @@ impl Metrics {
         r.pending=pending; r.pressure=pressure; r.state_at=now;
     }
     pub fn ingest_processed(&self, _count: u64) {
-        let now = Utc::now(); self.last_success.set(now.timestamp());
         let mut r = self.readings.lock().unwrap_or_else(|e|e.into_inner());
-        r.processed_at=now.timestamp_millis(); r.last_success=Some(now.timestamp());
+        r.processed_at = r.processed_at.max(Utc::now().timestamp_millis());
+        let seconds = r.processed_at.div_euclid(1000);
+        self.last_success.set(seconds);
+        r.last_success = Some(seconds);
     }
     pub fn broker_lag(&self, count: Option<i64>) {
         self.readings.lock().unwrap_or_else(|e| e.into_inner()).lag = count.filter(|n|*n>=0).map(|n|(n,Utc::now().timestamp_millis()));
@@ -106,8 +116,8 @@ impl Metrics {
         let r=self.readings.lock().unwrap_or_else(|e| e.into_inner());
         let ms=now.timestamp_millis();
         let fresh=|at:i64|at>0&&ms>=at&&ms-at<=60_000;
-        if ms.saturating_sub(r.started_ms)<300_000||!fresh(r.state_at)||!fresh(r.processed_at)||r.pending<0 { return Value::Null; }
-        let rate=r.committed.iter().filter(|(at,_)|*at<=ms&&ms-*at<300_000).map(|(_,n)|*n as f64).sum::<f64>()/300.0;
+        if ms.saturating_sub(r.started_ms)<self.rate_window_ms||!fresh(r.state_at)||!fresh(r.processed_at)||r.pending<0 { return Value::Null; }
+        let rate=r.committed.iter().filter(|(at,_)|*at<=ms&&ms-*at<self.rate_window_ms).map(|(_,n)|*n as f64).sum::<f64>()/(self.rate_window_ms as f64/1000.0);
         json!({"ingestProcessedRatePerSec":rate,"pendingLedgerCount":r.pending,
             "brokerLagCount":r.lag.filter(|(_,at)|fresh(*at)).map(|(n,_)|n),
             "lastIngestSuccessAt":r.last_success.and_then(|s|DateTime::from_timestamp(s,0)).map(iso),
@@ -120,6 +130,7 @@ impl Metrics {
     }
     pub async fn refresh_peaks(&self, runtime:&PgRuntime) -> Result<(),PgError> {
         let mut tx=runtime.begin_worker().await?;
+        tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", &[]).await?;
         let day=tx.query("SELECT count(*)::bigint,to_char(date_trunc('day',first_seen_at AT TIME ZONE 'UTC'),'YYYY-MM-DD') AS day FROM ingestion_evidence GROUP BY 2 ORDER BY 1 DESC,day ASC LIMIT 1",&[]).await?;
         let week=tx.query("SELECT count(*)::bigint,to_char(date_trunc('week',first_seen_at AT TIME ZONE 'UTC'),'YYYY-MM-DD') AS week_start,to_char(date_trunc('week',first_seen_at AT TIME ZONE 'UTC')+INTERVAL '6 days','YYYY-MM-DD') FROM ingestion_evidence GROUP BY 2,3 ORDER BY 1 DESC,week_start ASC LIMIT 1",&[]).await?;
         tx.commit().await?;
@@ -153,8 +164,8 @@ mod tests {
     use super::*;
     #[test]
     fn live_readings_require_warmup_recent_samples_and_nonnegative_counts() {
-        let metrics=Metrics::at(1_000_000).unwrap(); let now=DateTime::from_timestamp_millis(1_300_000).unwrap();
-        assert!(metrics.live(now).is_null()); metrics.sample_state_at(8,true,1_300_000); metrics.committed_at(300,1_300_000);
+        let metrics=Metrics::at(1_000_000,300).unwrap(); let now=DateTime::from_timestamp_millis(1_300_000).unwrap();
+        assert!(metrics.live(now).is_null()); metrics.sample_state_at(8,true,1_300_000); metrics.committed_at(300,||1_300_000);
         assert_eq!(metrics.live(now)["ingestProcessedRatePerSec"],1.0);
         assert_eq!(metrics.live(now)["pendingLedgerCount"],8);
         assert!(metrics.live(now-chrono::Duration::milliseconds(1)).is_null());
@@ -164,7 +175,7 @@ mod tests {
     }
     #[test]
     fn committed_rate_excludes_stale_and_future_samples_and_bounds_storage() {
-        let metrics=Metrics::at(1).unwrap();for i in 1..1000{metrics.committed_at(1, i*1000);}
+        let metrics=Metrics::at(1,300).unwrap();for i in 1..1000{metrics.committed_at(1, || i*1000);}
         assert!(metrics.readings.lock().unwrap().committed.len()<=300);
         metrics.sample_state_at(0,false,999_000);let now=DateTime::from_timestamp_millis(999_000).unwrap();
         assert_eq!(metrics.live(now)["ingestProcessedRatePerSec"],1.0);

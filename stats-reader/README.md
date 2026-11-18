@@ -3,7 +3,7 @@
 Tiny always-Ready HTTP service that serves precomputed public stats JSON
 for the product site. It is passive: the request path never computes
 metrics and never touches Postgres or Kafka. Snapshots are published to Redis
-and MinIO; the dedicated [C++ materializer](../octopus-metrics/README.md) owns
+and MinIO; the dedicated [C++ materializer](../../octopus-metrics/README.md) owns
 the publisher. The reader and publisher both have committed GitOps resources;
 fresh snapshots also require the publisher's account, stores, schema proof and
 runtime configuration. This README describes the source contract, not live
@@ -75,7 +75,7 @@ process reads: `redis-runtime/password` feeds `REDIS_PASSWORD`, and
 Use Go 1.25 or newer. Start from the workspace root:
 
 ```sh
-cd services/stats-reader
+cd services/octopus-rs/stats-reader
 make test
 make vet
 make fmt-check

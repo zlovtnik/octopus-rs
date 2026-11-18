@@ -15,6 +15,7 @@ use rdkafka::{
     TopicPartitionList,
 };
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -145,11 +146,13 @@ async fn native_mock_broker_processes_every_partition_and_restarts_from_committe
     .await;
     stop.cancel();
     task.await.unwrap().unwrap();
-    let mut observed = first.0.lock().unwrap().clone();
-    observed.sort();
+    let mut observed = BTreeMap::<_, Vec<_>>::new();
+    for &(partition, offset) in first.0.lock().unwrap().iter() {
+        observed.entry(partition).or_default().push(offset);
+    }
     assert_eq!(
         observed,
-        vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)]
+        BTreeMap::from([(0, vec![0, 1]), (1, vec![0, 1]), (2, vec![0, 1])])
     );
 
     let restarted = Handler(Arc::new(Mutex::new(Vec::new())));

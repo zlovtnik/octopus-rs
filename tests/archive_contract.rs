@@ -17,32 +17,27 @@ const MINIO_IMAGE: &str =
     "elestio/minio@sha256:25348a257f1ece1b192f25f6cd9854618fa86422ac87b494b5d4e629c556d4bd";
 
 struct Minio {
-    name: String,
+    container: Container,
     store: MinioStore,
 }
-impl Drop for Minio {
+struct Container(String);
+impl Drop for Container {
     fn drop(&mut self) {
         let _ = Command::new("docker")
-            .args(["rm", "-f", "-v", &self.name])
+            .args(["rm", "-f", "-v", &self.0])
             .output();
     }
 }
 impl Minio {
     async fn start() -> Self {
         let name = format!("native-archive-{}", uuid::Uuid::new_v4());
-        // Explicitly retain the same host endpoint across stop/start. Docker
-        // may reallocate an automatically assigned publish port on restart.
-        let reservation=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port=reservation.local_addr().unwrap().port();
-        drop(reservation);
-        let publish=format!("127.0.0.1:{port}:9000");
         support::checked(Command::new("docker").args([
             "run",
             "-d",
             "--name",
             &name,
             "-p",
-            &publish,
+            "127.0.0.1::9000",
             "-e",
             "MINIO_ROOT_USER=archive-test",
             "-e",
@@ -51,23 +46,9 @@ impl Minio {
             "server",
             "/data",
         ]));
-        let output = support::checked(Command::new("docker").args(["port", &name, "9000/tcp"]));
-        let endpoint = format!(
-            "http://{}",
-            String::from_utf8(output.stdout).unwrap().trim()
-        );
-        let store = MinioStore::new(
-            &endpoint,
-            "archive-test",
-            "archive-test-password",
-            "us-east-1",
-            "wireless-archive",
-        )
-        .unwrap();
-        let value = Self {
-            name,
-            store,
-        };
+        let container = Container(name);
+        let store = Self::store(&container);
+        let value = Self { container, store };
         let mut ready = false;
         for _ in 0..120 {
             if value.store.initialize().await.is_ok() {
@@ -79,18 +60,34 @@ impl Minio {
         assert!(ready, "scratch MinIO did not become ready");
         value
     }
-    fn stop(&self) {
-        support::checked(Command::new("docker").args(["stop", "--time", "1", &self.name]));
+    fn store(container: &Container) -> MinioStore {
+        let output = support::checked(Command::new("docker").args(["port", &container.0, "9000/tcp"]));
+        let endpoint = format!(
+            "http://{}",
+            String::from_utf8(output.stdout).unwrap().trim()
+        );
+        MinioStore::new(
+            &endpoint,
+            "archive-test",
+            "archive-test-password",
+            "us-east-1",
+            "wireless-archive",
+        )
+        .unwrap()
     }
-    async fn restart(&self) {
-        support::checked(Command::new("docker").args(["start", &self.name]));
+    fn stop(&self) {
+        support::checked(Command::new("docker").args(["stop", "--time", "1", &self.container.0]));
+    }
+    async fn restart(&mut self) {
+        support::checked(Command::new("docker").args(["start", &self.container.0]));
+        self.store = Self::store(&self.container);
         for _ in 0..120 {
             if self.store.initialize().await.is_ok() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let logs=Command::new("docker").args(["logs",&self.name]).output().unwrap();
+        let logs=Command::new("docker").args(["logs",&self.container.0]).output().unwrap();
         panic!("MinIO restart failed: {}",String::from_utf8_lossy(&logs.stderr));
     }
 }
@@ -147,7 +144,7 @@ async fn real_minio_archive_is_verified_restart_safe_and_retention_is_fenced() {
     let Some(fixture) = support::Fixture::start().await else {
         return;
     };
-    let objects = Minio::start().await;
+    let mut objects = Minio::start().await;
     let config = ArchiveConfig {
         enabled: true,
         hot_days: 1,
@@ -328,8 +325,7 @@ async fn real_minio_archive_is_verified_restart_safe_and_retention_is_fenced() {
     // A wrong receipt cannot clear payloads, including a forged destination.
     let valid = candidate("valid", r#"{"v": 3}"#);
     seed(&fixture.runtime, &valid).await;
-    let mut receipt = objects.store.archive(&valid).await.unwrap();
-    receipt.uri.push_str("-wrong");
+    let receipt = objects.store.archive(&candidate("other", &valid.payload)).await.unwrap();
     assert!(matches!(
         archiver.record_archive(&valid, &receipt).await,
         Err(ArchiveError::Integrity)

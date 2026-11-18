@@ -84,7 +84,8 @@ def source_evidence(lcov: str, root: Path) -> dict:
             source = source.resolve()
         elif line.startswith("DA:") and source is not None and source.is_relative_to(root / "src"):
             relative = source.relative_to(root).as_posix()
-            sources[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
+            if relative not in sources:
+                sources[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
     if not sources:
         raise CoverageError("normal build produced no executable production sources")
     return {"version": 1, "sources": sources}

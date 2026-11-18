@@ -62,10 +62,10 @@ macro_rules! section {
   impl Default for $name { fn default()->Self {Self {$($field:$default),*}} }
   impl $name {
    fn bind(&mut self, env:&BTreeMap<String,String>, errors:&mut Vec<String>){$($(if let Some(value)=env.get($env){match <$ty as EnvValue>::parse_env(value){Ok(v)=>self.$field=v,Err(())=>errors.push(concat!("invalid value for ",$env).into())}})*)*}
-   fn bind_config(&mut self, prefix:&str, values:&BTreeMap<String,hocon::Value>, errors:&mut Vec<String>){$(
+   fn bind_config(&mut self, prefix:&str, values:&BTreeMap<String,hocon::Value>, errors:&mut Vec<String>, unmatched:&mut BTreeSet<&str>){$(
     let field = if stringify!($field) == "manifest_sha256" { "manifest-sha-256".to_owned() } else { stringify!($field).replace('_',"-") };
     let path=format!("{prefix}.{field}");
-    if let Some(value)=values.get(&path) {match <$ty as EnvValue>::parse_config(value){Ok(value)=>self.$field=value,Err(())=>errors.push(format!("invalid value for {path}"))}}
+    if let Some(value)=values.get(&path) {unmatched.remove(path.as_str());match <$ty as EnvValue>::parse_config(value){Ok(value)=>self.$field=value,Err(())=>errors.push(format!("invalid value for {path}"))}}
    )*}
    pub const ENVIRONMENT_KEYS: &'static [&'static str] = &[$($($env,)*)*];
   }
@@ -313,7 +313,19 @@ impl AppConfig {
                 )]));
             }
         }
-        Self::from_sources(&std::env::vars().collect(), text.as_deref(), &properties)
+        let mut env = BTreeMap::new();
+        let known = Self::environment_keys();
+        for (key, value) in std::env::vars_os() {
+            let Ok(key) = key.into_string() else { continue };
+            match value.into_string() {
+                Ok(value) => { env.insert(key, value); }
+                Err(_) if known.contains(&key.as_str()) => {
+                    return Err(ConfigError(vec![format!("non-Unicode value for {key}")]));
+                }
+                Err(_) => {}
+            }
+        }
+        Self::from_sources(&env, text.as_deref(), &properties)
     }
     /// Precedence is explicit properties, HOCON overrides, bundled environment
     /// bindings, then defaults. Optional HOCON references preserve prior values.
@@ -325,38 +337,40 @@ impl AppConfig {
         let mut config = Self::from_env_unvalidated(env)?;
         if let Some(text) = text {
             let values = hocon::parse(text, env).map_err(|e| ConfigError(vec![e.to_string()]))?;
-            config.bind_config(&values)?;
+            config.bind_config(&values, false)?;
         }
         let values = properties
             .iter()
             .map(|(key, value)| (key.clone(), hocon::Value::Scalar(value.clone())))
             .collect();
-        config.bind_config(&values)?;
+        config.bind_config(&values, true)?;
         config.resolve_postgres_password(env, |path| std::fs::read_to_string(path))?;
         config.validate()?;
         Ok(config)
     }
-    fn bind_config(&mut self, values: &BTreeMap<String, hocon::Value>) -> Result<(), ConfigError> {
+    fn bind_config(&mut self, values: &BTreeMap<String, hocon::Value>, explicit: bool) -> Result<(), ConfigError> {
         let mut errors = Vec::new();
-        self.postgres.bind_config("postgres", values, &mut errors);
-        self.kafka.bind_config("kafka", values, &mut errors);
-        self.cron.bind_config("cron", values, &mut errors);
-        self.ingest.bind_config("ingest", values, &mut errors);
+        let mut unmatched: BTreeSet<_> = if explicit { values.keys().map(String::as_str).collect() } else { BTreeSet::new() };
+        self.postgres.bind_config("postgres", values, &mut errors, &mut unmatched);
+        self.kafka.bind_config("kafka", values, &mut errors, &mut unmatched);
+        self.cron.bind_config("cron", values, &mut errors, &mut unmatched);
+        self.ingest.bind_config("ingest", values, &mut errors, &mut unmatched);
         self.backpressure
-            .bind_config("backpressure", values, &mut errors);
-        self.http.bind_config("http", values, &mut errors);
+            .bind_config("backpressure", values, &mut errors, &mut unmatched);
+        self.http.bind_config("http", values, &mut errors, &mut unmatched);
         self.public_stats
-            .bind_config("public-stats", values, &mut errors);
-        self.sync.bind_config("sync", values, &mut errors);
-        self.wireless.bind_config("wireless", values, &mut errors);
+            .bind_config("public-stats", values, &mut errors, &mut unmatched);
+        self.sync.bind_config("sync", values, &mut errors, &mut unmatched);
+        self.wireless.bind_config("wireless", values, &mut errors, &mut unmatched);
         self.wireless
             .projection
-            .bind_config("wireless.projection", values, &mut errors);
-        self.runtime.bind_config("runtime", values, &mut errors);
+            .bind_config("wireless.projection", values, &mut errors, &mut unmatched);
+        self.runtime.bind_config("runtime", values, &mut errors, &mut unmatched);
         self.processors
-            .bind_config("processors", values, &mut errors);
-        self.archive.bind_config("archive", values, &mut errors);
-        self.dq.bind_config("dq", values, &mut errors);
+            .bind_config("processors", values, &mut errors, &mut unmatched);
+        self.archive.bind_config("archive", values, &mut errors, &mut unmatched);
+        self.dq.bind_config("dq", values, &mut errors, &mut unmatched);
+        errors.extend(unmatched.into_iter().map(|key| format!("unknown configuration property {}", crate::errors::sanitize(key))));
         if errors.is_empty() {
             Ok(())
         } else {
@@ -578,6 +592,8 @@ impl AppConfig {
             "enabled DQ requires MINIO_ENDPOINT, MINIO_ACCESS_KEY_ID and MINIO_SECRET_ACCESS_KEY",
         );
         let k = &self.kafka;
+        check(k.load_topic != "sync.oracle.load", "kafka.load-topic must be sync.oracle.load");
+        check(k.result_topic != "sync.oracle.result", "kafka.result-topic must be sync.oracle.result");
         check(
             k.dlq_suffix.is_empty(),
             "kafka.dlq-suffix must not be empty",
@@ -616,6 +632,10 @@ impl AppConfig {
         check(
             self.public_stats.enabled && self.public_stats.allowed_origins.is_empty(),
             "public-stats.allowed-origins must not be empty when public-stats.enabled=true",
+        );
+        check(
+            self.public_stats.allowed_origins.iter().any(|origin| origin.trim().is_empty()),
+            "public-stats.allowed-origins must not contain blank entries",
         );
         check(
             self.public_stats.peaks_refresh_seconds <= 0,

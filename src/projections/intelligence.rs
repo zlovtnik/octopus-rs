@@ -329,38 +329,33 @@ pub struct IdentityCluster {
     pub run_id: String,
 }
 pub fn identity_clusters(edges: &[(String, String, f64)]) -> Vec<IdentityCluster> {
-    let mut graph: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    let mut confidences = BTreeMap::<(&str, &str), f64>::new();
+    let mut graph: BTreeMap<&str, BTreeMap<&str, f64>> = BTreeMap::new();
     for (left, right, confidence) in edges
         .iter()
         .filter(|(l, r, c)| !l.is_empty() && !r.is_empty() && l != r && c.is_finite() && *c >= 0.0)
     {
-        graph.entry(left).or_default().insert(right);
-        graph.entry(right).or_default().insert(left);
-        let pair = if left < right {
-            (left.as_str(), right.as_str())
-        } else {
-            (right.as_str(), left.as_str())
-        };
-        let value = confidences.entry(pair).or_insert(0.0);
-        *value = value.max(confidence.clamp(0.0, 1.0));
+        for (from, to) in [(left, right), (right, left)] {
+            let value = graph.entry(from).or_default().entry(to).or_insert(0.0);
+            *value = value.max(confidence.clamp(0.0, 1.0));
+        }
     }
     let mut remaining: BTreeSet<_> = graph.keys().copied().collect();
     let mut result = Vec::new();
     while let Some(start) = remaining.first().copied() {
         let mut frontier = vec![start];
         let mut members = BTreeSet::new();
+        let mut confidence: f64 = 1.0;
         while let Some(node) = frontier.pop() {
             if members.insert(node) {
                 remaining.remove(node);
-                frontier.extend(graph[node].iter().copied());
+                for (&neighbor, &weight) in &graph[node] {
+                    confidence = confidence.min(weight);
+                    if !members.contains(neighbor) {
+                        frontier.push(neighbor);
+                    }
+                }
             }
         }
-        let confidence = confidences
-            .iter()
-            .filter(|((l, r), _)| members.contains(l) && members.contains(r))
-            .map(|(_, v)| *v)
-            .fold(1.0, f64::min);
         let parts: Vec<_> = members.into_iter().collect();
         let id = stable_id("identity-cluster", &parts);
         result.push(IdentityCluster {

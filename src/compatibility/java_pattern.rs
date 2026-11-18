@@ -10,6 +10,8 @@ use fancy_regex::Regex;
 #[error("invalid or unsupported Java schema pattern")]
 pub struct PatternError;
 
+const FINAL_TERMINATOR: &str = r"(?=\z|\r\n\z|[\r\u{0085}\u{2028}\u{2029}]\z|(?<!\r)\n\z)";
+
 pub fn compile(pattern: &str) -> Result<Regex, PatternError> {
     if pattern.encode_utf16().count() > 256 {
         return Err(PatternError);
@@ -75,7 +77,7 @@ pub fn compile(pattern: &str) -> Result<Regex, PatternError> {
                 'R' => Some("(?:\\r\\n|[\\n\\x0B\\f\\r\\u{0085}\\u{2028}\\u{2029}])"),
                 'b' if !unicode_classes && class_depth == 0 => Some("(?:(?<=[a-zA-Z_0-9])(?![a-zA-Z_0-9])|(?<![a-zA-Z_0-9])(?=[a-zA-Z_0-9]))"),
                 'B' if !unicode_classes && class_depth == 0 => Some("(?!(?:(?<=[a-zA-Z_0-9])(?![a-zA-Z_0-9])|(?<![a-zA-Z_0-9])(?=[a-zA-Z_0-9])))"),
-                'Z' if class_depth == 0 => Some("(?=\\r?\\n?\\z|[\\u{0085}\\u{2028}\\u{2029}]\\z)"),
+                'Z' if class_depth == 0 => Some(FINAL_TERMINATOR),
                 _ => None,
             };
             if let Some(class) = class {
@@ -141,7 +143,11 @@ pub fn compile(pattern: &str) -> Result<Regex, PatternError> {
                     continue;
                 }
                 '$' if class_depth == 0 => {
-                    output.push_str("(?=\\z|\\r\\n\\z|[\\r\\n\\u{0085}\\u{2028}\\u{2029}]\\z)");
+                    output.push_str(FINAL_TERMINATOR);
+                    continue;
+                }
+                '~' if class_depth > 0 => {
+                    output.push_str(r"\x7e");
                     continue;
                 }
                 '(' if class_depth == 0 && chars.peek() == Some(&'?') => {

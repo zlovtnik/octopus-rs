@@ -103,6 +103,15 @@ pub async fn replace_approved_clusters(tx: &mut PgTransaction) -> Result<i32, Pr
     }
     Ok(total)
 }
+async fn lock_identity_clusters(tx: &mut PgTransaction) -> Result<(), ProjectionError> {
+    tx.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('octopus-identity-clusters',0)) IS NULL",
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Runs inside the DQ caller's authorization/fence transaction. This deliberately
 /// rebuilds clusters from all approved edges after reconciling the scoped input.
 pub async fn apply_identity_candidates(
@@ -110,11 +119,7 @@ pub async fn apply_identity_candidates(
     candidates: &[(String, String, f64)],
     reconciliation_ids: &[String],
 ) -> Result<Vec<String>, ProjectionError> {
-    tx.query(
-        "SELECT pg_advisory_xact_lock(hashtextextended('octopus-identity-clusters',0)) IS NULL",
-        &[],
-    )
-    .await?;
+    lock_identity_clusters(tx).await?;
     let mut ids = Vec::new();
     for (left, right, confidence) in candidates {
         ids.push(persist_merge_candidate(tx, left, right, *confidence).await?);
@@ -164,11 +169,7 @@ impl ProjectionStore {
         candidate_changes: i32,
     ) -> Result<i32, ProjectionError> {
         let mut tx = self.runtime.begin_worker().await?;
-        tx.query(
-            "SELECT pg_advisory_xact_lock(hashtextextended('octopus-identity-clusters',0)) IS NULL",
-            &[],
-        )
-        .await?;
+        lock_identity_clusters(&mut tx).await?;
         let reconciled = reconcile(&mut tx, None).await?;
         let total = if reconciled == 0 && candidate_changes <= 0 {
             0

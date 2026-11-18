@@ -108,7 +108,7 @@ impl Backpressure {
         let mut tx = self.runtime.begin_worker().await?;
         let count: i64 = tx
             .query(
-                "SELECT COUNT(*) FROM sync_events WHERE status IN ('pending','processing')",
+                "SELECT COUNT(*) FROM sync_events e WHERE e.status IN ('pending','processing') OR (e.status='batched' AND EXISTS (SELECT 1 FROM sync_batches b WHERE b.stream_name=e.stream_name AND b.dedupe_key=e.dedupe_key AND b.status IN ('pending','dispatched','running')))",
                 &[],
             )
             .await?[0]
@@ -147,7 +147,7 @@ impl Parking {
         })
     }
     async fn park(&self, record: &BrokerRecord, message: &str) -> Result<(), BoundaryError> {
-        let body=serde_json::json!({"consumer_group":self.group,"error":crate::errors::sanitize(message),"error_class":"IllegalArgumentException","offset":record.offset,"original":record.payload,"partition":record.partition,"topic":record.topic}).to_string();
+        let body = kafka::poison_body(&self.group, record, message, "IllegalArgumentException");
         let key = record
             .key
             .clone()
@@ -209,6 +209,9 @@ impl BatchHandler<ScanRequestRecord> for ScanHandler {
         records: Vec<LockedRecord<ScanRequestRecord>>,
     ) -> BoxFuture<'_, Result<(), BoundaryError>> {
         Box::pin(async move {
+            if records.is_empty() {
+                return Ok(());
+            }
             self.backpressure.await_permit().await?;
             for locked in records {
                 if !should_ingest(locked.decoded.stream_name(), self.projection_only) {
@@ -344,6 +347,9 @@ impl BatchHandler<Value> for WirelessHandler {
         records: Vec<LockedRecord<Value>>,
     ) -> BoxFuture<'_, Result<(), BoundaryError>> {
         Box::pin(async move {
+            if records.is_empty() {
+                return Ok(());
+            }
             self.backpressure.await_permit().await?;
             for locked in records {
                 match self.handler.project(locked.decoded, locked.metadata).await {
@@ -742,6 +748,13 @@ impl OutboxPublisher {
         else {
             return Ok(DispatchOutcome::NoWork);
         };
+        let batch = match record.load_batch_id() {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.store.park_malformed(&record, &error.to_string()).await.map_err(load_workload)?;
+                return Ok(DispatchOutcome::ContinueDraining);
+            }
+        };
         let mut fields = std::collections::HashMap::new();
         opentelemetry::global::get_text_map_propagator(|propagator| {
             propagator.inject_context(&tracing::Span::current().context(), &mut fields)
@@ -765,18 +778,6 @@ impl OutboxPublisher {
         );
         match tokio::time::timeout(timeout, publish).await {
             Ok(Ok(_)) => {
-                // Match the established publication/receipt order: malformed
-                // load identity is parked only after the broker acknowledged.
-                let batch = match record.load_batch_id() {
-                    Ok(batch) => batch,
-                    Err(error) => {
-                        self.store
-                            .park_malformed(&record, &error.to_string())
-                            .await
-                            .map_err(load_workload)?;
-                        return Ok(DispatchOutcome::ContinueDraining);
-                    }
-                };
                 // False means a newer fence owns the row or the batch already
                 // progressed; publication remains at-least-once either way.
                 if self
@@ -790,11 +791,8 @@ impl OutboxPublisher {
                     Ok(DispatchOutcome::ContinueDraining)
                 }
             }
-            error => {
-                let message = match error {
-                    Ok(Err((error, _))) => crate::errors::sanitize(&error.to_string()),
-                    _ => "outbox publication timed out".into(),
-                };
+            Ok(Err((error, _))) => {
+                let message = crate::errors::sanitize(&error.to_string());
                 let exponent = (record.attempt_count.max(1) - 1).min(30) as u32;
                 let delay = i64::from(self.retry_base_seconds)
                     .saturating_mul(1_i64 << exponent)
@@ -805,6 +803,7 @@ impl OutboxPublisher {
                     .map_err(load_workload)?;
                 Ok(DispatchOutcome::StopDraining)
             }
+            Err(_) => Ok(DispatchOutcome::StopDraining),
         }
     }
     pub fn workload(&self, interval: Duration, drain_limit: usize) -> Workload {

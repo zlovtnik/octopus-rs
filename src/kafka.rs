@@ -5,6 +5,7 @@ use crate::{
     domain::{BrokerConsumerContract, BrokerRecordMetadata},
     util::sha256_hex,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{future::BoxFuture, FutureExt};
 use opentelemetry::trace::TraceContextExt;
 use rdkafka::{
@@ -71,7 +72,7 @@ pub struct BrokerRecord {
     pub partition: i32,
     pub offset: i64,
     pub key: Option<String>,
-    pub payload: Option<String>,
+    pub payload: Option<Vec<u8>>,
     pub headers: BTreeMap<String, String>,
 }
 
@@ -84,9 +85,7 @@ impl BrokerRecord {
             key: message
                 .key()
                 .map(|value| String::from_utf8_lossy(value).into_owned()),
-            payload: message
-                .payload()
-                .map(|value| String::from_utf8_lossy(value).into_owned()),
+            payload: message.payload().map(<[u8]>::to_vec),
             headers: message
                 .headers()
                 .map(|headers| {
@@ -105,8 +104,35 @@ impl BrokerRecord {
     }
 
     fn weight(&self) -> usize {
-        self.payload.as_ref().map_or(0, String::len)
+        self.payload.as_ref().map_or(0, Vec::len)
     }
+}
+
+pub(crate) fn poison_body(
+    group: &str,
+    record: &BrokerRecord,
+    message: &str,
+    class: &str,
+) -> String {
+    let mut body = serde_json::json!({
+        "consumer_group": group,
+        "error": crate::errors::sanitize(message),
+        "error_class": crate::errors::sanitize(class),
+        "offset": record.offset,
+        "original": null,
+        "partition": record.partition,
+        "topic": record.topic
+    });
+    if let Some(raw) = &record.payload {
+        match std::str::from_utf8(raw) {
+            Ok(text) => body["original"] = text.into(),
+            Err(_) => {
+                body["original"] = STANDARD.encode(raw).into();
+                body["original_encoding"] = "base64".into();
+            }
+        }
+    }
+    body.to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -355,7 +381,9 @@ pub async fn process_batch<A: Send + 'static>(
                 Some(raw) if raw.len() > max_bytes => Err(Poison::invalid(
                     "record exceeds kafka.locked-batch-max-bytes",
                 )),
-                Some(raw) => decode(raw),
+                Some(raw) => std::str::from_utf8(raw)
+                    .map_err(|_| Poison::invalid("broker payload is not valid UTF-8"))
+                    .and_then(&decode),
             };
             match decoded {
                 Ok(decoded) => {
@@ -442,8 +470,7 @@ impl DurableBoundary for NativeBoundary {
         reason: &'a Poison,
     ) -> BoxFuture<'a, Result<(), BoundaryError>> {
         Box::pin(async move {
-            let body = serde_json::json!({"consumer_group":self.group,"error":crate::errors::sanitize(&reason.message),"error_class":crate::errors::sanitize(&reason.error_class),
-                "offset":record.offset,"original":record.payload,"partition":record.partition,"topic":record.topic}).to_string();
+            let body = poison_body(&self.group, record, &reason.message, &reason.error_class);
             let key = record
                 .key
                 .clone()
@@ -790,7 +817,7 @@ mod tests {
             partition: 0,
             offset,
             key: None,
-            payload: payload.map(str::to_string),
+            payload: payload.map(|value| value.as_bytes().to_vec()),
             headers: BTreeMap::new(),
         }
     }

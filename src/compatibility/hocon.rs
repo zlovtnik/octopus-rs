@@ -147,6 +147,9 @@ impl Parser<'_> {
                     self.take();
                     return Ok(Value::List(items));
                 }
+                if self.rest().starts_with('[') {
+                    return self.fail();
+                }
                 let Value::Scalar(value) = self.value()? else {
                     return self.fail();
                 };
@@ -210,10 +213,20 @@ impl Parser<'_> {
                 return self.fail();
             }
             if self.rest().starts_with('{') {
+                self.values.remove(&path);
                 self.take();
                 self.object(&path, true, depth + 1)?;
             } else {
                 let value = self.value()?;
+                if !matches!(value, Value::Reference { .. }) {
+                    let descendants = format!("{path}.");
+                    let superseded: Vec<_> = self.values.range(descendants.clone()..)
+                        .take_while(|(key, _)| key.starts_with(&descendants))
+                        .map(|(key, _)| key.clone()).collect();
+                    for key in superseded {
+                        self.values.remove(&key);
+                    }
+                }
                 self.values.entry(path).or_default().push(value);
             }
             self.spaces(false);
@@ -233,13 +246,18 @@ fn resolve(
     definitions: &BTreeMap<String, Vec<Value>>,
     env: &BTreeMap<String, String>,
     visiting: &mut BTreeSet<String>,
+    completed: &mut BTreeMap<String, Option<Value>>,
 ) -> Result<Option<Value>, Error> {
-    if !visiting.insert(key.to_owned()) {
+    if let Some(value) = completed.get(key) {
+        return Ok(value.clone());
+    }
+    if visiting.len() >= 128 || !visiting.insert(key.to_owned()) {
         return Err(Error { line: 0 });
     }
     let mut result = None;
     if let Some(values) = definitions.get(key) {
-        for value in values {
+        let start = values.iter().rposition(|v| !matches!(v, Value::Reference { .. })).unwrap_or(0);
+        for value in &values[start..] {
             match value {
                 Value::Reference { name, optional } => {
                     let referenced = if name == key {
@@ -247,7 +265,7 @@ fn resolve(
                             .clone()
                             .or_else(|| env.get(name).cloned().map(Value::Scalar))
                     } else if definitions.contains_key(name) {
-                        resolve(name, definitions, env, visiting)?
+                        resolve(name, definitions, env, visiting, completed)?
                     } else {
                         env.get(name).cloned().map(Value::Scalar)
                     };
@@ -262,6 +280,7 @@ fn resolve(
         }
     }
     visiting.remove(key);
+    completed.insert(key.to_owned(), result.clone());
     Ok(result)
 }
 
@@ -286,8 +305,10 @@ pub fn parse(text: &str, env: &BTreeMap<String, String>) -> Result<BTreeMap<Stri
         return parser.fail();
     }
     let mut result = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    let mut completed = BTreeMap::new();
     for key in parser.values.keys() {
-        if let Some(value) = resolve(key, &parser.values, env, &mut BTreeSet::new())? {
+        if let Some(value) = resolve(key, &parser.values, env, &mut visiting, &mut completed)? {
             result.insert(key.clone(), value);
         }
     }

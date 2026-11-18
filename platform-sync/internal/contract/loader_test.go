@@ -61,6 +61,14 @@ spec:
       vaultPath: secret/first
       keys: [password]
   validation:
+    identityCertificate:
+      secretName: identity-tls
+      dnsName: proxy.example.test
+    lokiHtpasswd:
+      secretName: loki
+      usernameKey: username
+      passwordKey: password
+      htpasswdKey: htpasswd
     postgres:
       endpointConfigMapName: endpoint
       database: sync

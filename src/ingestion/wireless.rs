@@ -42,12 +42,7 @@ fn boolean(paths: &[&str]) -> String {
 fn double(path: &str) -> String {
     let value = extracted(path);
     let raw = format!("TRIM({value} #>> '{{}}')");
-    let scientific = format!("({raw} ~ '^[+-]?[0-9]+([.][0-9]+)?[eE][+-]?[0-9]{{1,3}}$')");
-    let exponent = format!(
-        "CAST(CASE WHEN {scientific} THEN split_part(LOWER({raw}),'e',2) ELSE NULL END AS INTEGER)"
-    );
-    let mantissa = format!("CAST(CASE WHEN {scientific} THEN split_part(LOWER({raw}),'e',1) ELSE NULL END AS DECIMAL(38,16))");
-    format!("CAST(CASE WHEN jsonb_typeof({value}) IN ('number','string') AND ({raw} ~ '^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)$' OR ({scientific} AND {exponent} BETWEEN -324 AND 308 AND ({exponent}<308 OR ABS({mantissa})<=1.7976931348623157))) THEN {raw} ELSE NULL END AS DOUBLE PRECISION)")
+    format!("CAST(CASE WHEN jsonb_typeof({value}) IN ('number','string') AND {raw} ~ '^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$' AND pg_input_is_valid({raw}, 'double precision') THEN {raw} ELSE NULL END AS DOUBLE PRECISION)")
 }
 
 fn coalesce(values: impl Iterator<Item = String>) -> String {

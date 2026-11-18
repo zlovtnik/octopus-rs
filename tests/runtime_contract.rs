@@ -23,7 +23,7 @@ use rdkafka::{
     client::DefaultClientContext,
     consumer::{BaseConsumer, Consumer},
     producer::FutureRecord,
-    ClientConfig, TopicPartitionList,
+    ClientConfig, Message, Offset, TopicPartitionList,
 };
 use serde_json::{json, Value};
 use std::{
@@ -101,8 +101,7 @@ async fn real_outbox_waits_for_broker_ack_and_retries_after_outage() {
     assert!(row[0].get::<_, bool>(1));
     assert_eq!(row[0].get::<_, i32>(2), 2);
     tx.commit().await.unwrap();
-    // Malformed load identity follows the same established order: publish,
-    // broker acknowledgement, then durable malformed parking with receipt time.
+    // Malformed load identity is parked before publication.
     fixture.admin("INSERT INTO octopus_core.outbox_events(outbox_id,source_type,source_id,event_type,destination_topic,message_key,payload) VALUES(gen_random_uuid(),'test','malformed-load','load','sync.oracle.load','malformed:1','{\"batch_id\":\"invalid\"}')");
     assert_eq!(
         publisher.dispatch_next().await.unwrap(),
@@ -115,11 +114,11 @@ async fn real_outbox_waits_for_broker_ack_and_retries_after_outage() {
     let (_, high) = observer
         .fetch_watermarks(&cfg.load_topic, 0, Duration::from_secs(5))
         .unwrap();
-    assert_eq!(high, 1);
+    assert_eq!(high, 0);
     let mut tx = fixture.runtime.begin_worker().await.unwrap();
     let row=tx.query("SELECT status,published_at IS NOT NULL FROM outbox_events WHERE source_id='malformed-load'",&[]).await.unwrap();
     assert_eq!(row[0].get::<_, String>(0), "failed");
-    assert!(row[0].get::<_, bool>(1));
+    assert!(!row[0].get::<_, bool>(1));
     tx.commit().await.unwrap();
 }
 struct Broker {
@@ -134,17 +133,18 @@ impl Drop for Broker {
     }
 }
 impl Broker {
-    async fn start() -> Self {
+    fn try_start() -> Option<Self> {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = socket.local_addr().unwrap().port();
         drop(socket);
         let name = format!("native-redpanda-{}", uuid::Uuid::new_v4());
         let bootstrap = format!("127.0.0.1:{port}");
-        support::checked(Command::new("docker").args([
+        let broker = Self { name, bootstrap };
+        let output = Command::new("docker").args([
             "run",
             "-d",
             "--name",
-            &name,
+            &broker.name,
             "-p",
             &format!("127.0.0.1:{port}:9092"),
             REDPANDA,
@@ -163,9 +163,20 @@ impl Broker {
             "--kafka-addr",
             "0.0.0.0:9092",
             "--advertise-kafka-addr",
-            &bootstrap,
-        ]));
-        let broker = Self { name, bootstrap };
+            &broker.bootstrap,
+        ]).output().unwrap();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("port is already allocated") || stderr.contains("address already in use") {
+                return None;
+            }
+            panic!("Redpanda fixture startup failed: {stderr}");
+        }
+        Some(broker)
+    }
+
+    async fn start() -> Self {
+        let broker = (0..5).find_map(|_| Self::try_start()).expect("could not allocate Redpanda port");
         let consumer: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", &broker.bootstrap)
             .set("group.id", "native-redpanda-preflight-v1")
@@ -389,6 +400,20 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
     for (topic, observer) in &observers {
         await_offset(observer, topic, 1).await;
     }
+    let dlq: BaseConsumer = consumer_settings(&cfg.kafka, "runtime-test-dlq-observer-v1")
+        .unwrap().create().unwrap();
+    for (source, original) in [(&cfg.kafka.load_topic, &load), (&cfg.kafka.result_topic, &result)] {
+        let topic = format!("{source}{}", cfg.kafka.dlq_suffix);
+        let mut assignment = TopicPartitionList::new();
+        assignment.add_partition_offset(&topic, 0, Offset::Beginning).unwrap();
+        dlq.assign(&assignment).unwrap();
+        let record = dlq.poll(Duration::from_secs(10)).expect("missing DLQ delivery").unwrap();
+        let envelope: Value = serde_json::from_slice(record.payload().unwrap()).unwrap();
+        assert_eq!(envelope["topic"], source.as_str());
+        assert_eq!(envelope["partition"], 0);
+        assert_eq!(envelope["offset"], 0);
+        assert_eq!(envelope["original"], original.as_str());
+    }
     assert!(supervisor.ready());
     let mut tx = fixture.runtime.begin_worker().await.unwrap();
     let counts=tx.query("SELECT (SELECT count(*) FROM sync_events WHERE stream_name='runtime.unknown' AND status='completed'),(SELECT count(*) FROM sensors WHERE sensor_id='runtime-sensor'),(SELECT count(*) FROM wireless_projection_group_receipts WHERE group_id=$1)",&[&cfg.kafka.wireless_audit_consumer]).await.unwrap();
@@ -397,16 +422,9 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
     assert_eq!(counts[0].get::<_, i64>(2), 1);
     tx.commit().await.unwrap();
 
-    // Stop PostgreSQL while another record is outstanding. The group must not
-    // move past it until the original transaction can reach durable completion.
-    support::checked(Command::new("docker").args(["pause", &fixture.name]));
-    struct Resume(String);
-    impl Drop for Resume {
-        fn drop(&mut self) {
-            let _ = Command::new("docker").args(["unpause", &self.0]).output();
-        }
-    }
-    let resume = Resume(fixture.name.clone());
+    // Hold the ingestion table so we can observe intake before releasing it.
+    let mut blocker = fixture.runtime.begin_worker().await.unwrap();
+    blocker.execute("LOCK TABLE sync_events IN ACCESS EXCLUSIVE MODE", &[]).await.unwrap();
     let next = scan.replace("runtime-1", "runtime-2");
     producer
         .send(
@@ -417,11 +435,29 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
         )
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut observer = fixture.runtime.begin_worker().await.unwrap();
+            let waiting: bool = observer.query(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='octopus_core.sync_events'::regclass AND NOT granted)",
+                &[],
+            ).await.unwrap()[0].get(0);
+            observer.commit().await.unwrap();
+            if waiting { break; }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.expect("scan did not start processing");
     assert_eq!(offset(&observers[0].1, &cfg.kafka.scan_topic), Some(1));
     assert_eq!(committed.0.load(Ordering::SeqCst), 5);
-    drop(resume);
+    blocker.rollback().await.unwrap();
     await_offset(&observers[0].1, &cfg.kafka.scan_topic, 2).await;
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    let persisted: bool = tx.query(
+        "SELECT EXISTS(SELECT 1 FROM sync_events WHERE stream_name='runtime.unknown' AND dedupe_key='runtime-2' AND status='completed')",
+        &[],
+    ).await.unwrap()[0].get(0);
+    tx.commit().await.unwrap();
+    assert!(persisted);
     stop.cancel();
     tokio::time::timeout(Duration::from_secs(10), task)
         .await

@@ -120,6 +120,7 @@ func validatePostgresAccount(parent context.Context, pg contract.PostgresValidat
 	config.User = user
 	config.Password = password
 	config.TLSConfig = tlsConfig.Clone()
+	config.Fallbacks = nil
 	config.ConnectTimeout = 5 * time.Second
 	connection, err := pgx.ConnectConfig(ctx, config)
 	if err != nil {
@@ -246,7 +247,10 @@ func validateAccountGrants(ctx context.Context, connection *pgx.Conn, user strin
 		if err := requireSchemaPrivileges(ctx, connection, "atheros_search", "USAGE"); err != nil {
 			return err
 		}
-		return requireTableGrants(ctx, connection, octopusAtherosGrants())
+		if err := requireTableGrants(ctx, connection, octopusAtherosGrants()); err != nil {
+			return err
+		}
+		return requireSequenceGrants(ctx, connection, octopusAtherosSequenceGrants())
 	default:
 		return fmt.Errorf("no grant matrix is defined for account %s", user)
 	}
@@ -293,7 +297,9 @@ func requireAllTablePrivileges(ctx context.Context, connection *pgx.Conn, schema
 func requireAllSequencePrivileges(ctx context.Context, connection *pgx.Conn, schema string, privileges ...string) error {
 	for _, privilege := range privileges {
 		var allowed bool
-		query := `select count(*) = 0 or bool_and(has_sequence_privilege(current_user, format('%I.%I', sequence_schema, sequence_name), $2)) from information_schema.sequences where sequence_schema = $1`
+		query := `select count(*) = 0 or bool_and(has_sequence_privilege(current_user, c.oid, $2))
+			from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+			where n.nspname = $1 and c.relkind = 'S'`
 		if err := connection.QueryRow(ctx, query, schema, privilege).Scan(&allowed); err != nil {
 			return fmt.Errorf("check %s on all %s sequences: %w", privilege, schema, err)
 		}
@@ -341,6 +347,18 @@ func atherosSearchGrants() []tableGrant {
 		{table: "atheros_search.schema_readiness", privileges: []string{"SELECT"}},
 		{table: "atheros_search.search_documents", privileges: []string{"SELECT"}},
 		{table: "atheros_search.embedding_jobs", privileges: []string{"SELECT", "UPDATE"}},
+		{table: "atheros_search.embedding_repair_progress", privileges: []string{"SELECT", "INSERT", "UPDATE"}},
+		{table: "atheros_search.embedding_repair_receipts", privileges: []string{"SELECT", "INSERT"}},
+		{table: "atheros_search.proxy_attribution_window", privileges: []string{"SELECT"}},
+		{table: "atheros_search.proxy_behavior_status", privileges: []string{"SELECT"}},
+		{table: "atheros_search.proxy_destination_history", privileges: []string{"SELECT"}},
+		{table: "atheros_search.proxy_device_window", privileges: []string{"SELECT"}},
+		{table: "atheros_search.proxy_event_evidence", privileges: []string{"SELECT"}},
+		{table: "atheros_search.proxy_flow", privileges: []string{"SELECT"}},
+		{table: "atheros_search.proxy_host_current", privileges: []string{"SELECT"}},
+		{table: "atheros_search.proxy_host_window", privileges: []string{"SELECT"}},
+		{table: "atheros_search.proxy_preparation_policy", privileges: []string{"SELECT"}},
+		{table: "atheros_search.proxy_signal", privileges: []string{"SELECT"}},
 		{table: "atheros_search.embeddings", privileges: []string{"SELECT", "INSERT", "UPDATE"}},
 		{table: "atheros_search.search_vectors_event", privileges: []string{"SELECT", "INSERT", "UPDATE"}},
 		{table: "atheros_search.search_vectors_device", privileges: []string{"SELECT", "INSERT", "UPDATE"}},
@@ -399,6 +417,7 @@ func octopusCoreGrants() []tableGrant {
 		"wireless_shadow_alert_inputs", "wireless_sensors", "wireless_audit_frames",
 		"wireless_bandwidth_windows", "wireless_client_inventory", "wireless_probe_requests",
 		"proxy_blocked_host_rollups", "proxy_payload_audit", "work_leases", "processor_state",
+		"proxy_preparation_dirty", "proxy_preparation_progress", "proxy_window_dirty",
 		"retention_runs", "reconciliation_findings", "outbox_publish_attempts",
 		"dq_scope_policies", "dq_processors", "dq_processor_versions", "dq_runs",
 		"dq_workers", "dq_attempts", "dq_receipts", "dq_audit", "dq_outbox",
@@ -410,7 +429,10 @@ func octopusCoreGrants() []tableGrant {
 }
 
 func octopusCoreSequenceGrants() []sequenceGrant {
-	grants := make([]sequenceGrant, 0, 9)
+	grants := []sequenceGrant{
+		{sequence: "octopus_core.proxy_events_observation_revision_seq", privileges: []string{"USAGE", "SELECT"}},
+		{sequence: "octopus_core.proxy_window_revision_seq", privileges: []string{"USAGE", "SELECT"}},
+	}
 	for _, sequence := range []string{
 		"sync_errors_id_seq", "wireless_authorized_networks_id_seq", "wireless_sensors_sensor_pk_seq",
 		"wireless_audit_frames_frame_pk_seq", "wireless_bandwidth_windows_bw_pk_seq",
@@ -441,6 +463,10 @@ func octopusAtherosGrants() []tableGrant {
 		{table: "atheros_search.search_vectors_behaviour", privileges: selectDelete},
 		{table: "atheros_search.search_vectors_sequence", privileges: selectDelete},
 		{table: "atheros_search.similarity_scan_state", privileges: []string{"SELECT", "INSERT", "UPDATE"}},
+		{table: "atheros_search.embedding_repair_receipts", privileges: []string{"SELECT", "INSERT"}},
+		{table: "atheros_search.proxy_behavior_policy", privileges: []string{"SELECT"}},
+		{table: "atheros_search.proxy_feed_snapshot_binding", privileges: []string{"SELECT", "INSERT"}},
+		{table: "atheros_search.proxy_preparation_policy", privileges: []string{"SELECT", "INSERT", "UPDATE"}},
 	}
 	for _, table := range []string{
 		"behaviour_snapshots", "baseline_profiles", "frame_sequences", "sequence_transitions",
@@ -449,9 +475,18 @@ func octopusAtherosGrants() []tableGrant {
 		"identity_clusters", "identity_cluster_members", "merge_candidates", "ap_catalog",
 		"wireless_signal_summaries", "investigation_watermarks",
 		"wireless_observation_summaries", "wireless_topology_nodes", "wireless_topology_edges",
+		"proxy_attribution_window", "proxy_behavior_status", "proxy_destination_history",
+		"proxy_device_window", "proxy_document_state", "proxy_event_evidence", "proxy_flow",
+		"proxy_host_current", "proxy_host_window", "proxy_signal_state",
 	} {
 		grants = append(grants, tableGrant{table: "atheros_search." + table, privileges: crud})
 	}
 	grants = append(grants, tableGrant{table: "atheros_search.merge_decisions", privileges: []string{"SELECT"}})
 	return grants
+}
+
+func octopusAtherosSequenceGrants() []sequenceGrant {
+	return []sequenceGrant{
+		{sequence: "atheros_search.proxy_behavior_revision_seq", privileges: []string{"USAGE", "SELECT"}},
+	}
 }

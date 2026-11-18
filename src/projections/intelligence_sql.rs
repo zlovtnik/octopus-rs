@@ -5,8 +5,11 @@
 pub const BEHAVIOR_CANDIDATES_0: &str = r#"WITH source_windows AS (
              SELECT frame.source_mac,
                     FLOOR(EXTRACT(EPOCH FROM frame.observed_at) / 3600) AS window_bucket,
-                    COUNT(*) AS source_event_count
+                    COUNT(*) AS source_event_count,
+                    COUNT(*) FILTER (WHERE qos.retry) AS retry_count,
+                    COUNT(*) FILTER (WHERE qos.protected) AS protected_count
              FROM wireless_frames frame
+             LEFT JOIN wireless_frame_qos qos ON qos.dedupe_key = frame.dedupe_key
              WHERE frame.source_mac IS NOT NULL
              GROUP BY frame.source_mac, window_bucket
            ), candidate_windows AS (
@@ -18,6 +21,8 @@ pub const BEHAVIOR_CANDIDATES_0: &str = r#"WITH source_windows AS (
                )
              WHERE snapshot.snapshot_key IS NULL
                 OR snapshot.event_count <> source.source_event_count
+                OR snapshot.retry_count IS DISTINCT FROM source.retry_count
+                OR snapshot.protected_count IS DISTINCT FROM source.protected_count
              ORDER BY source.window_bucket, source.source_mac
              LIMIT $1::int
            )
@@ -38,7 +43,8 @@ pub const BEHAVIOR_CANDIDATES_0: &str = r#"WITH source_windows AS (
 pub const TIMING_CANDIDATES_0: &str = r#"WITH source_windows AS (
              SELECT frame.source_mac,
                     FLOOR(EXTRACT(EPOCH FROM frame.observed_at) / 3600) AS window_bucket,
-                    COUNT(*) AS source_event_count
+                    COUNT(*) AS source_event_count,
+                    MAX(frame.updated_at) AS updated_at
              FROM wireless_frames frame
              WHERE frame.source_mac IS NOT NULL
              GROUP BY frame.source_mac, window_bucket
@@ -51,6 +57,7 @@ pub const TIMING_CANDIDATES_0: &str = r#"WITH source_windows AS (
                )
              WHERE profile.profile_key IS NULL
                 OR profile.source_event_count <> source.source_event_count
+                OR profile.updated_at < source.updated_at
              ORDER BY source.window_bucket, source.source_mac
              LIMIT $1::int
            )
@@ -71,7 +78,8 @@ pub const TIMING_CANDIDATES_0: &str = r#"WITH source_windows AS (
 pub const SEQUENCE_CANDIDATES_0: &str = r#"WITH source_sessions AS (
              SELECT identity_row.session_key, COUNT(*) AS source_event_count
              FROM wireless_frame_identity identity_row
-             WHERE identity_row.session_key IS NOT NULL
+             JOIN wireless_frames frame ON frame.dedupe_key = identity_row.dedupe_key
+             WHERE identity_row.session_key IS NOT NULL AND frame.source_mac IS NOT NULL
              GROUP BY identity_row.session_key
            ), candidate_sessions AS (
              SELECT source.session_key
@@ -91,6 +99,7 @@ pub const SEQUENCE_CANDIDATES_0: &str = r#"WITH source_sessions AS (
            LEFT JOIN wireless_frame_qos qos ON qos.dedupe_key = frame.dedupe_key
            LEFT JOIN wireless_frame_network network_row ON network_row.dedupe_key = frame.dedupe_key
            LEFT JOIN wireless_frame_security security_row ON security_row.dedupe_key = frame.dedupe_key
+           WHERE frame.source_mac IS NOT NULL
            ORDER BY identity_row.session_key, frame.observed_at, frame.dedupe_key"#;
 
 // Parameters: 1=batchLimit
@@ -127,13 +136,13 @@ pub const PERSIST_BEHAVIOR_0: &str = r#"INSERT INTO atheros_search.behaviour_sna
              signal_avg_dbm, retry_count, protected_count, unprotected_count,
              unique_bssid_count, mac_rotation_indicators, projection_run_id
            ) VALUES (
-             $1, $2, $3,
+             $1::text::uuid, $2, $3,
              $4, $5, $6, $7,
              $8, $9, $10,
              CAST($11::text AS JSON), CAST($12::text AS JSON),
              $13, $14, $15, $16,
              $17, $18, $19,
-             CAST($20::text AS JSON), $21
+             CAST($20::text AS JSON), $21::text::uuid
            ) ON CONFLICT (snapshot_key) DO UPDATE SET
              location_id = EXCLUDED.location_id,
              sensor_id = EXCLUDED.sensor_id,
@@ -162,10 +171,10 @@ pub const PERSIST_TIMING_0: &str = r#"INSERT INTO atheros_search.timing_profiles
              window_start, window_end, embedding_text, tsft_p50_us, tsft_p95_us,
              tsft_jitter, wall_p50_ms, wall_jitter_ms, source_event_count, projection_run_id
            ) VALUES (
-             $1, $2, $3, $4,
+             $1::text::uuid, $2, $3, $4,
              $5, $6, $7, NULL,
              $8, $9, $10,
-             $11, $12, $13, $14
+             $11, $12, $13, $14::text::uuid
            ) ON CONFLICT (profile_key) DO UPDATE SET
              sensor_id = EXCLUDED.sensor_id,
              location_id = EXCLUDED.location_id,
@@ -195,7 +204,7 @@ pub const PERSIST_SEQUENCE_1: &str = r#"INSERT INTO atheros_search.frame_sequenc
                         ) VALUES (
                           $1, $2, $3, $4,
                           $5, $6, $7, $7,
-                          $8, $9
+                          $8, $9::text::uuid
                         ) ON CONFLICT (session_key) DO UPDATE SET
                           source_mac = EXCLUDED.source_mac,
                           location_id = EXCLUDED.location_id,
@@ -227,7 +236,7 @@ pub const PERSIST_SEQUENCE_4: &str = r#"INSERT INTO atheros_search.sequence_tran
                transition_count, previous_total, projection_run_id
              ) VALUES (
                $1, $2, $3, 'frame_sequence',
-               $4, $5, $6
+               $4, $5, $6::text::uuid
              )"#;
 
 // Parameters: 1=value.sessionKey, 2=previous.value, 3=total, 4=value.projectionRunId
@@ -236,7 +245,7 @@ pub const PERSIST_SEQUENCE_5: &str = r#"INSERT INTO atheros_search.sequence_prev
                session_key, previous_token, sequence_kind, previous_total, projection_run_id
              ) VALUES (
                $1, $2, 'frame_sequence', $3,
-               $4
+               $4::text::uuid
              )"#;
 
 // Parameters: 1=previous
@@ -256,7 +265,7 @@ pub const PERSIST_SEQUENCE_7: &str = r#"INSERT INTO atheros_search.sequence_tran
                                    SUM(contribution.transition_count), totals.previous_total,
                                    $1,
                                    SUM(contribution.transition_count) / NULLIF(totals.previous_total, 0),
-                                   $2
+                                   $2::text::uuid
                             FROM atheros_search.sequence_transition_contributions contribution
                             JOIN (
                               SELECT previous_token, sequence_kind, SUM(previous_total) AS previous_total
@@ -277,8 +286,8 @@ pub const PERSIST_SEQUENCE_7: &str = r#"INSERT INTO atheros_search.sequence_tran
 pub const PERSIST_BASELINE_0: &str = r#"INSERT INTO atheros_search.baseline_profiles (
              baseline_id, bssid, metric, p5, p50, p95, sample_count, projection_run_id
            ) VALUES (
-             $1, $2, $3, $4,
-             $5, $6, $7, $8
+             $1::text::uuid, $2, $3, $4,
+             $5, $6, $7, $8::text::uuid
            ) ON CONFLICT (bssid, metric) DO UPDATE SET
              p5 = EXCLUDED.p5,
              p50 = EXCLUDED.p50,

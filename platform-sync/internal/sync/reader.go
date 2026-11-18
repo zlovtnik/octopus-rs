@@ -15,6 +15,11 @@ type SecretReader interface {
 
 func ReadAllVault(ctx context.Context, logger *log.Logger, vaultClient SecretReader, c *contract.Contract) (map[string]map[string][]byte, error) {
 	secretData := make(map[string]map[string][]byte)
+	names := make([]string, 0, len(c.Inputs))
+	for _, input := range c.Inputs {
+		names = append(names, input.Name)
+	}
+	logger.AddRedactedNames(names...)
 
 	for _, input := range c.Inputs {
 		name := input.Name

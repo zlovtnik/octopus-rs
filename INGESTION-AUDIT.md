@@ -18,8 +18,10 @@ The independent [manifest](Cargo.toml) and [lockfile](Cargo.lock) build
 The [PostgreSQL base](src/postgres.rs), [raw intake](src/ingestion.rs),
 [wireless hydration](src/ingestion/wireless.rs), [broker adapter](src/kafka.rs),
 [error redaction](src/errors.rs) and [DQ contracts](src/dq.rs) also exist.
-There is no assembled coordinator binary, five-consumer application, HTTP server
-or native runtime image yet.
+The [entrypoint](src/main.rs) and [application startup](src/application/mod.rs)
+build with the [broker-drain workload assembly](src/application/workloads.rs).
+The assembly connects the five consumer lanes, job planner, backlog recovery,
+load dispatch and outbox publisher. Other processor selections fail validation.
 
 Configuration currently binds environment variables and defaults; HOCON file
 and JVM system-property overrides remain unimplemented. Per-slice tests must
@@ -36,16 +38,14 @@ including real compiler/LLVM coverage exclusion checks.
 [The migration checker](scripts/check_migration.py) reconciles all 262
 baseline files; all [ledger](migration-ledger.json) dispositions remain pending.
 Its completion mode fails until independently verified dispositions exist.
-Full native validation still requires the executable and all coverage mappings.
+All seven [coverage domains](coverage-policy.json) have source mappings.
+Acceptance requires a successful runtime build and a passing measured report.
 
 The dated [advisor execution checkpoint](../../advisor-plans/010-octopus-rust-file-inventory.md#execution-checkpoint-2026-11-18)
 lists finished slices, evidence limits and the next implementation order.
-G1/G2 remain in progress; G3-G5 have not started. Remaining runtime work includes
-the load/result/outbox flows and thirteen typed sinks, all selected processor
-workloads, archive/retention, DQ stores/runtime/acceptance, HTTP/metrics/tracing
-and complete differential coverage. Configuration/HOCON, Java text/time and
-optional TLS-store compatibility gaps also remain open. Actual Linux CI network
-connectivity and production-image behavior still need verification.
+G1/G2 remain open. G3 has opt-in CI, Compose, image and DQ validation paths
+in the [native delivery instructions](README.md). Actual Linux connectivity,
+runtime parity, image execution and DQ acceptance still require evidence.
 
 ## Runtime activation evidence
 

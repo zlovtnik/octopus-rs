@@ -41,12 +41,20 @@ if args[0] == os.environ.get('FAIL_DOCKER_COMMAND'):
         docker.chmod(0o755)
         self.env = dict(os.environ, PATH=f"{commands}:{os.environ['PATH']}",
                         DOCKER_CALLS=str(self.log), CI_USE_DOCKER_CONTEXT="false")
+        self.env["OCTOPUS_UMBRELLA_ROOT"] = str(self.base)
+        for name in ("sql/postgres/octopus_core/manifest.yaml", "k8s/postgres-schema-executor/entrypoint.sh"):
+            path = self.base / name
+            path.parent.mkdir(parents=True)
+            path.write_text("fixture\n")
 
     def runtime_inputs(self, map_domains: bool = True) -> None:
         # Temporary inputs exercise the delivery guard; no application is built.
         shutil.copy(ROOT / "templates/Cargo.toml.example", self.root / "Cargo.toml")
         (self.root / "Cargo.lock").write_text("version = 4\n", encoding="utf-8")
         (self.root / "src").mkdir()
+        for directory in ("resources", "tests"):
+            (self.root / directory).mkdir()
+        shutil.copy(ROOT / "rust-toolchain.toml", self.root)
         (self.root / "src/main.rs").write_text("// preflight fixture\n", encoding="utf-8")
         policy = json.loads((self.root / "coverage-policy.json").read_text())
         for name, domain in policy["domains"].items():
@@ -112,12 +120,15 @@ if args[0] == os.environ.get('FAIL_DOCKER_COMMAND'):
         self.assertLess(task.index(install), task.index("export OCTOPUS_REQUIRE_DOCKER=true"))
         self.assertLess(task.index(install), task.index("python3 scripts/run_coverage.py"))
 
-    def test_container_failure_is_preserved_and_no_artifact_is_copied(self) -> None:
+    def test_container_failure_collects_diagnostics_before_cleanup(self) -> None:
         self.runtime_inputs()
         result = self.run_native(FAIL_DOCKER_COMMAND="run")
         self.assertEqual(17, result.returncode, result.stderr)
-        self.assertFalse(any(args[0] == "cp" for args in self.calls()))
-        self.assertTrue(any(args[0] == "rm" for args in self.calls()))
+        calls = self.calls()
+        copies = [args for args in calls if args[0] == "cp"]
+        self.assertEqual(len(copies), 1)
+        self.assertIn("octopus-coverage", copies[0][1])
+        self.assertLess(calls.index(copies[0]), next(i for i, args in enumerate(calls) if args[0] == "rm"))
 
     def test_artifact_copy_failure_is_preserved_during_cleanup(self) -> None:
         self.runtime_inputs()

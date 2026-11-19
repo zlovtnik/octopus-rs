@@ -1,23 +1,66 @@
 # Octopus Rust migration
 
-> **Status: Native library migration in progress.** An independent Cargo library
-> and lockfile exist. The full coordinator runtime, binary and image remain pending.
+> **Status: G3 candidate validation in progress.** Scala owns the running
+> coordinator. The [native assembly](src/application/workloads.rs) supports the
+> broker-drain profile. Enabling a processor without native wiring fails startup.
 
-The running coordinator remains [Scala Octopus](../octopus/README.md). This
-folder contains delivery tooling and the first native library slices from the
-[migration inventory](../../advisor-plans/010-octopus-rust-file-inventory.md#build-delivery-and-documentation)
-without changing its production build, image, schema, broker consumers or DQ
-acceptance path. [The capability ledger](INGESTION-AUDIT.md) records the runtime
-work still required. Configuration, domain contracts, processor selection and
-identity/payload utilities are being ported; PostgreSQL base work is in progress.
-The executable and complete runtime coverage are prerequisites for cutover.
+## Local development and native candidate validation
+
+Use the following entry points from an umbrella checkout. Image and DQ
+provenance checks require a clean parent commit pinning this Rust submodule.
+
+| Consumer | Native candidate invocation |
+| --- | --- |
+| Parent Jenkins | Enable `RUN_OCTOPUS_NATIVE` to run native coverage, the release build and image checks alongside Scala. |
+| Standalone Jenkins | Enable `RUN_NATIVE` and supply the pinning parent SHA in `PARENT_REVISION` for the canonical schema and executor fixtures. |
+| Local runtime Compose | `docker compose -f docker-compose.yaml -f docker-compose.octopus-native.yaml up --build octopus` |
+| Build-only Compose | `OCTOPUS_BUILD_DOCKERFILE=services/octopus-rs/templates/Dockerfile docker compose -f docker-compose.build.yaml build java-coordinator` |
+| Image contract | `make octopus-native-image-check` builds linux/amd64 and verifies both OCI revision labels, the ELF entrypoint and configuration behavior. |
+| DQ acceptance | In the [DQ test environment](../dq/tests/acceptance.md), run `python3 services/dq/tests/acceptance/run.py --octopus-native`. |
+
+The Compose builds use local development labels by default. The image contract
+build derives both revision labels from Git. G3 still requires a passing
+Linux run, native DQ acceptance and the coordinated default switch after G1/G2.
+
+## G4 deployment rehearsal
+
+From the parent checkout, run `python3 scripts/octopus_rehearse_promotion.py --fixture`
+to render the production app-stack, change the coordinator digest and remove its
+JVM option in a temporary Git repository, then revert the commit. The check
+compares the entire candidate render against those two expected changes and
+requires byte-identical manifests after revert.
+
+With a clean parent revision pinning the native source and the published
+linux/amd64 candidate digest in `DIGEST`, run:
+
+```sh
+python3 scripts/octopus_g4_smoke.py "$DIGEST" --config-only
+python3 scripts/octopus_g4_smoke.py "$DIGEST"
+python3 scripts/octopus_rehearse_promotion.py --digest "$DIGEST" > /tmp/octopus-promotion.patch
+```
+
+The [runtime check](../../scripts/octopus_g4_smoke.py) needs Docker and registry
+access to the candidate, production Scala rollback image and pinned schema
+executor. It starts a unique Compose project with disposable PostgreSQL and
+Redpanda storage. It uses production topic files, group IDs, broker-drain
+selection, schema checksum, port, resource limits and non-root security
+settings. It checks health and metrics aliases, sends SIGTERM, restarts with
+the broker offline, then checks recovery. Repeated delivery on partition zero
+must advance the Kafka commit, retain one event and preserve evidence for each
+offset across native restart and Scala rollback.
+
+The fixture connects directly to PostgreSQL with verified TLS. It samples CPU
+and memory for one scan record per phase. PgBouncer, archive/DQ dependencies,
+other consumer lanes and resource sizing under representative traffic require
+separate evidence. Review the [promotion diff](../../scripts/octopus_rehearse_promotion.py)
+only after image, parity, rollback and resource checks pass.
 
 ## Validate the scaffold
 
 From the umbrella repository root, with Python 3.11+ and Bash:
 
 ```bash
-bash services/octopus-rust/scripts/ci/test.sh
+bash services/octopus-rs/scripts/ci/test.sh
 python3 scripts/check-docs.py
 ```
 
@@ -26,23 +69,15 @@ orchestration and CI lifecycle behavior, then shell syntax checks. Tests use
 temporary fixtures and mocked tools; they do not exercise coordinator behavior
 or contact a database, broker or Docker daemon. No Python packages are required.
 
-The [Jenkinsfile](Jenkinsfile) supports either an umbrella checkout or a future
-standalone checkout of this directory. Its default stage validates the scaffold.
-`RUN_NATIVE=true` additionally requires native tests, coverage and a release
-artifact. A green scaffold-only job is not native validation or release approval.
-No Jenkins job registration, parent pipeline, image publication or deployment
-configuration is changed. The nested `.github/` files preserve ownership and
-branch-source policy for a future standalone repository; GitHub does not execute
-workflows nested inside a service directory in the umbrella repository.
+The [Jenkinsfile](Jenkinsfile) runs tooling checks by default. Native validation
+is available in both checkout layouts as described above.
 
 ## Native build contract
 
 The active [Cargo.toml](Cargo.toml) defines an independent library workspace with
 its own [Cargo.lock](Cargo.lock). Its `[workspace]` prevents Cargo from selecting
 the parent proxy workspace. [src/lib.rs](src/lib.rs) exposes implemented library
-slices; the intended package and future binary are `octopus`. There is no
-`src/main.rs` or placeholder executable. The
-[binary manifest template](templates/Cargo.toml.example) remains inactive.
+slices. The coordinator binary target is `octopus`.
 
 [rust-toolchain.toml](rust-toolchain.toml) pins Rust
 1.100.0 and includes rustfmt, Clippy and matching LLVM tools. The active
@@ -55,35 +90,23 @@ require their own dependency and image verification.
 Validate the implemented library from the umbrella root:
 
 ```bash
-bash services/octopus-rust/scripts/ci/core.sh
+bash services/octopus-rs/scripts/ci/core.sh
 ```
 
 [core.sh](scripts/ci/core.sh) runs formatting, warnings-as-errors Clippy, locked
 tests and a locked release library build. It does not build a coordinator
 executable or establish database/broker integration, coverage or runtime parity.
-Comparisons against the Scala configuration resource and canonical processor
-contract run when those umbrella files are available; standalone checkouts skip
-those comparisons at runtime and can compile the library tests. Complete
-standalone fixture packaging remains a G1 prerequisite.
-The configuration binding currently supports defaults and environment variables;
-Scala HOCON file and JVM system-property overrides remain a compatibility gap.
+The canonical database fixture requires the umbrella schema and executor.
 
-Future native validation is invoked explicitly:
+Run native validation with
 
 ```bash
-bash services/octopus-rust/scripts/ci/native.sh
+bash services/octopus-rs/scripts/ci/native.sh
 ```
 
-**Today this exits 2 with a missing-runtime diagnostic.** Before any Cargo or
-Docker command, it requires nonempty service-local `Cargo.toml`, `Cargo.lock`
-and `src/main.rs`, plus complete coverage mappings. It never builds the parent
-proxy as a substitute. The manifest and real lockfile now exist; implementing
-the executable and completing coverage mappings remain required. Do not add a
-placeholder runtime to satisfy the guard.
-
-Once those inputs exist, [the runner](scripts/ci/native.sh) requires a working
-Docker daemon, stages this folder into a named container, and runs
-[the native task](scripts/ci/tasks/native.sh). That task installs Python in the
+The runner checks the manifest, lockfile, entrypoint and coverage mappings,
+then stages the crate, canonical SQL and schema executor into the Linux builder.
+It runs [the native task](scripts/ci/tasks/native.sh). That task installs Python in the
 builder, checks formatting and Clippy warnings, runs locked instrumented Cargo
 tests, enforces coverage and performs a locked release build. It sets
 `OCTOPUS_REQUIRE_DOCKER=true`; future integration tests must honor that contract
@@ -125,9 +148,7 @@ additional test policy before runtime parity can be claimed.
 | PostgreSQL | 29% |
 | Processor | 86% |
 
-Each domain's `paths` is intentionally empty. During runtime implementation,
-map each domain to real service-relative production files or directories under
-`src/`; for example, a `src/config` directory is valid only once it exists.
+The policy maps seven domains to production source paths.
 The checker rejects empty/nonexistent mappings, overlapping domain paths,
 escaping paths and domains with no measured executable lines. Exact file
 mappings require executable coverage for that file. Directory mappings reject
@@ -154,29 +175,12 @@ behavioral equivalence; rebaselines still require measured evidence and review.
 
 ## Image and activation prerequisites
 
-[templates/Dockerfile](templates/Dockerfile) is deliberately inactive. It expects
-the umbrella repository as its build context and a future executable target.
-It describes a multi-stage native build, UID/GID 1000, port 8081,
-`/health` image check, canonical topic bootstrap assets and an executable
-entrypoint. The future binary must implement health behavior; no HTTP server is
-included here. Native TLS libraries, schema manifests, authority data and other
-runtime resources must be inventoried and packaged when their code is ported.
-
-The template requires `PARENT_COMMIT` and `OCTOPUS_COMMIT` labels. While this
-folder lives in the parent repository, the parent revision identifies its native
-source; the Octopus submodule revision identifies the Scala migration baseline.
-Before release, reconcile those semantics and native binary validation with the
-existing [image contract checker](../../scripts/octopus_image_contract.py).
-That checker still expects the production JAR and must remain in force for Scala.
-
-Activation also requires runtime parity, Docker-backed database/broker tests,
-native image smoke tests under the deployment security context, DQ acceptance,
-resource measurements and reviewed Git/Argo CD digest promotion. Preserve group
-identities, offsets, schema manifests and ingestion evidence. The parent
-[Makefile](../../Makefile), [CI runner](../../scripts/ci/octopus.sh),
-[DQ acceptance harness](../dq/tests/acceptance/run.py) and
-[production manifests](../../cyber-stack/base/java-coordinator/deployment.yaml)
-continue to target Scala until that coordinated change is verified.
+The [candidate Dockerfile](templates/Dockerfile) takes the parent checkout as
+its build context and packages the native binary, runtime resources and
+Redpanda bootstrap files. The [image checker](../../scripts/octopus_image_contract.py)
+verifies the parent and Rust gitlink revisions against a clean checkout.
+Production activation also requires Docker-backed database and broker tests,
+DQ acceptance, deployment smoke tests and reviewed digest promotion.
 
 ## Local development resources
 
@@ -187,10 +191,6 @@ compatibility wrapper and delegates to the parent
 workspace layout and is not run by scaffold tests. No topic definitions are
 duplicated in Rust.
 
-The parent [local runtime configuration](../../docker-compose.yaml) still
-launches the Scala JAR. Changing an image entrypoint alone will not convert that
-path; it remains a separate activation prerequisite.
-
 ## Migration tracking and verification
 
 [migration-ledger.json](migration-ledger.json) records all 262 tracked baseline
@@ -199,8 +199,8 @@ files, with every disposition still pending independent parity evidence.
 inventory reconciliation and evidence references. From the umbrella root:
 
 ```bash
-python3 services/octopus-rust/scripts/check_migration.py
-python3 services/octopus-rust/scripts/check_migration.py --require-complete
+python3 services/octopus-rs/scripts/check_migration.py
+python3 services/octopus-rs/scripts/check_migration.py --require-complete
 ```
 
 The inventory check reconciles 262 pending rows; completion mode exits 1.

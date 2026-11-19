@@ -826,7 +826,7 @@ impl OutboxPublisher {
         )
     }
 }
-fn load_workload(error: LoadError) -> WorkloadError {
+pub fn load_workload(error: LoadError) -> WorkloadError {
     if error.is_invariant() || error.is_retryable() {
         WorkloadError::Retryable(crate::errors::sanitize(&error.to_string()))
     } else {

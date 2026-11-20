@@ -5,6 +5,7 @@ use crate::{
     dispatch::DispatchStore,
     load::LoadError,
     postgres::{PgError, PgRuntime},
+    util::java_trim,
 };
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -24,9 +25,9 @@ impl Planner {
     pub fn new(runtime: Arc<PgRuntime>, cfg: &AppConfig) -> Self {
         let streams = cfg
             .ingest
-            .stream_names
+            .load_stream_names
             .iter()
-            .map(|s| s.trim())
+            .map(|s| java_trim(s))
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect::<BTreeSet<_>>()

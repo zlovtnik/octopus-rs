@@ -32,9 +32,9 @@ async fn legacy_planning_is_atomic_and_completion_repair_resumes_from_checkpoint
         return;
     };
     let mut cfg = AppConfig::default();
-    cfg.ingest.stream_names = vec!["proxy.events".into(), "wireless.audit".into()];
+    cfg.ingest.load_stream_names = vec!["proxy.events".into(), "wireless.audit".into()];
     cfg.cron.ingest_batch_size = 1;
-    fixture.admin("INSERT INTO octopus_core.sync_events(stream_name,dedupe_key,observed_at,payload_ref,status,attempt_count) VALUES('proxy.events','first','2026-11-18T00:00:00Z','inline://json/e30','pending',0),('wireless.audit','second','2026-11-18T00:00:01Z','inline://json/e30','pending',0),('ignored','third','2026-11-18T00:00:02Z','inline://json/e30','pending',0)");
+    fixture.admin("INSERT INTO octopus_core.sync_events(stream_name,dedupe_key,observed_at,payload_ref,status,attempt_count) VALUES('proxy.events','first','2026-11-18T00:00:00Z','inline://json/e30','pending',0),('wireless.audit','second','2026-11-18T00:00:01Z','inline://json/e30','pending',0),('wireless.alert.rogue_ap','third','2026-11-18T00:00:02Z','inline://json/e30','pending',0)");
     let planner = Planner::new(fixture.runtime.clone(), &cfg);
     assert_eq!(planner.process_ingest().await.unwrap(), 1);
     assert_eq!(planner.process_ingest().await.unwrap(), 1);
@@ -47,6 +47,7 @@ async fn legacy_planning_is_atomic_and_completion_repair_resumes_from_checkpoint
     assert_eq!(rows[0].get::<_, String>(4), "first");
     assert_eq!(rows[1].get::<_, String>(4), "1794960001");
     assert_eq!(rows[2].get::<_, String>(1), "pending");
+    assert_eq!(rows[2].get::<_, Option<String>>(4), None);
     tx.commit().await.unwrap();
     fixture.admin("UPDATE octopus_core.sync_batches SET status='completed';UPDATE octopus_core.sync_jobs SET status='completed'");
     assert_eq!(planner.reconcile_completed_events().await.unwrap(), 1);
@@ -155,7 +156,11 @@ async fn canonical_runtime_restarts_records_cancellation_and_rejects_stale_fence
         .unwrap()
         .contains("do-not-retain"));
     stop.cancel();
-    tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 
     let leases = LeaseStore::new(runtime.clone());
     let first = leases
@@ -241,7 +246,11 @@ async fn canonical_runtime_restarts_records_cancellation_and_rejects_stale_fence
     .await
     .unwrap();
     stop.cancel();
-    assert!(tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().is_err());
+    assert!(tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
     assert!(leases
         .acquire("processor", id.as_str(), "owner-d", 60)
         .await

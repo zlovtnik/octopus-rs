@@ -30,6 +30,11 @@ const PERIODIC: [ProcessorId; 4] = [
 ];
 
 pub fn validate(enabled: &BTreeSet<ProcessorId>) -> Result {
+    if enabled.contains(&ProcessorId::SyncOutboxPublisher)
+        && !enabled.contains(&ProcessorId::SyncBacklogRecovery)
+    {
+        return Err("sync-outbox-publisher requires sync-backlog-recovery".into());
+    }
     let available: Vec<_> = ProcessorId::KAFKA_CONSUMERS
         .into_iter()
         .chain(PERIODIC)
@@ -185,4 +190,25 @@ pub fn build(
         }));
     }
     Ok(workloads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbox_publisher_requires_backlog_recovery() {
+        assert!(validate(&BTreeSet::new()).is_ok());
+        let mut enabled = BTreeSet::from([
+            ProcessorId::SyncJobPlanner,
+            ProcessorId::SyncLoadDispatch,
+            ProcessorId::SyncOutboxPublisher,
+        ]);
+        assert_eq!(
+            validate(&enabled).unwrap_err().to_string(),
+            "sync-outbox-publisher requires sync-backlog-recovery"
+        );
+        enabled.insert(ProcessorId::SyncBacklogRecovery);
+        assert!(validate(&enabled).is_ok());
+    }
 }

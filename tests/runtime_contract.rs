@@ -140,34 +140,39 @@ impl Broker {
         let name = format!("native-redpanda-{}", uuid::Uuid::new_v4());
         let bootstrap = format!("127.0.0.1:{port}");
         let broker = Self { name, bootstrap };
-        let output = Command::new("docker").args([
-            "run",
-            "-d",
-            "--name",
-            &broker.name,
-            "-p",
-            &format!("127.0.0.1:{port}:9092"),
-            REDPANDA,
-            "redpanda",
-            "start",
-            "--mode",
-            "dev-container",
-            "--smp",
-            "1",
-            "--memory",
-            "512M",
-            "--reserve-memory",
-            "0M",
-            "--overprovisioned",
-            "--check=false",
-            "--kafka-addr",
-            "0.0.0.0:9092",
-            "--advertise-kafka-addr",
-            &broker.bootstrap,
-        ]).output().unwrap();
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                &broker.name,
+                "-p",
+                &format!("127.0.0.1:{port}:9092"),
+                REDPANDA,
+                "redpanda",
+                "start",
+                "--mode",
+                "dev-container",
+                "--smp",
+                "1",
+                "--memory",
+                "512M",
+                "--reserve-memory",
+                "0M",
+                "--overprovisioned",
+                "--check=false",
+                "--kafka-addr",
+                "0.0.0.0:9092",
+                "--advertise-kafka-addr",
+                &broker.bootstrap,
+            ])
+            .output()
+            .unwrap();
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("port is already allocated") || stderr.contains("address already in use") {
+            if stderr.contains("port is already allocated")
+                || stderr.contains("address already in use")
+            {
                 return None;
             }
             panic!("Redpanda fixture startup failed: {stderr}");
@@ -176,7 +181,9 @@ impl Broker {
     }
 
     async fn start() -> Self {
-        let broker = (0..5).find_map(|_| Self::try_start()).expect("could not allocate Redpanda port");
+        let broker = (0..5)
+            .find_map(|_| Self::try_start())
+            .expect("could not allocate Redpanda port");
         let consumer: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", &broker.bootstrap)
             .set("group.id", "native-redpanda-preflight-v1")
@@ -285,6 +292,7 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
     };
     cfg.wireless.projection.mode = "projected".into();
     cfg.runtime.consumers_enabled = true;
+    cfg.ingest.load_stream_names = vec!["proxy.events".into()];
     let bindings = [
         (
             cfg.kafka.scan_consumer.clone(),
@@ -358,7 +366,7 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
     let task = tokio::spawn(async move { runner.run(workloads, cancelled).await });
     let producer = producer(&cfg.kafka).unwrap();
     let observed = chrono::Utc::now().to_rfc3339();
-    let scan=json!({"stream_name":"runtime.unknown","dedupe_key":"runtime-1","observed_at":observed,"payload_ref":"inline://json/eyJldmVudF90eXBlIjoidW5rbm93biJ9"}).to_string();
+    let scan=json!({"stream_name":"wireless.alert.rogue_ap","dedupe_key":"runtime-1","observed_at":observed,"payload_ref":"inline://json/eyJldmVudF90eXBlIjoidW5rbm93biJ9"}).to_string();
     let heartbeat =
         json!({"event_id":"heartbeat-1","sensor_id":"runtime-sensor","observed_at":observed})
             .to_string();
@@ -401,13 +409,23 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
         await_offset(observer, topic, 1).await;
     }
     let dlq: BaseConsumer = consumer_settings(&cfg.kafka, "runtime-test-dlq-observer-v1")
-        .unwrap().create().unwrap();
-    for (source, original) in [(&cfg.kafka.load_topic, &load), (&cfg.kafka.result_topic, &result)] {
+        .unwrap()
+        .create()
+        .unwrap();
+    for (source, original) in [
+        (&cfg.kafka.load_topic, &load),
+        (&cfg.kafka.result_topic, &result),
+    ] {
         let topic = format!("{source}{}", cfg.kafka.dlq_suffix);
         let mut assignment = TopicPartitionList::new();
-        assignment.add_partition_offset(&topic, 0, Offset::Beginning).unwrap();
+        assignment
+            .add_partition_offset(&topic, 0, Offset::Beginning)
+            .unwrap();
         dlq.assign(&assignment).unwrap();
-        let record = dlq.poll(Duration::from_secs(10)).expect("missing DLQ delivery").unwrap();
+        let record = dlq
+            .poll(Duration::from_secs(10))
+            .expect("missing DLQ delivery")
+            .unwrap();
         let envelope: Value = serde_json::from_slice(record.payload().unwrap()).unwrap();
         assert_eq!(envelope["topic"], source.as_str());
         assert_eq!(envelope["partition"], 0);
@@ -416,15 +434,19 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
     }
     assert!(supervisor.ready());
     let mut tx = fixture.runtime.begin_worker().await.unwrap();
-    let counts=tx.query("SELECT (SELECT count(*) FROM sync_events WHERE stream_name='runtime.unknown' AND status='completed'),(SELECT count(*) FROM sensors WHERE sensor_id='runtime-sensor'),(SELECT count(*) FROM wireless_projection_group_receipts WHERE group_id=$1)",&[&cfg.kafka.wireless_audit_consumer]).await.unwrap();
+    let counts=tx.query("SELECT (SELECT count(*) FROM sync_events WHERE stream_name='wireless.alert.rogue_ap' AND status='completed'),(SELECT count(*) FROM sensors WHERE sensor_id='runtime-sensor'),(SELECT count(*) FROM wireless_projection_group_receipts WHERE group_id=$1),(SELECT count(*) FROM sync_batches WHERE stream_name='wireless.alert.rogue_ap')",&[&cfg.kafka.wireless_audit_consumer]).await.unwrap();
     assert_eq!(counts[0].get::<_, i64>(0), 1);
     assert_eq!(counts[0].get::<_, i64>(1), 1);
     assert_eq!(counts[0].get::<_, i64>(2), 1);
+    assert_eq!(counts[0].get::<_, i64>(3), 0);
     tx.commit().await.unwrap();
 
     // Hold the ingestion table so we can observe intake before releasing it.
     let mut blocker = fixture.runtime.begin_worker().await.unwrap();
-    blocker.execute("LOCK TABLE sync_events IN ACCESS EXCLUSIVE MODE", &[]).await.unwrap();
+    blocker
+        .execute("LOCK TABLE sync_events IN ACCESS EXCLUSIVE MODE", &[])
+        .await
+        .unwrap();
     let next = scan.replace("runtime-1", "runtime-2");
     producer
         .send(
@@ -453,7 +475,7 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
     await_offset(&observers[0].1, &cfg.kafka.scan_topic, 2).await;
     let mut tx = fixture.runtime.begin_worker().await.unwrap();
     let persisted: bool = tx.query(
-        "SELECT EXISTS(SELECT 1 FROM sync_events WHERE stream_name='runtime.unknown' AND dedupe_key='runtime-2' AND status='completed')",
+        "SELECT EXISTS(SELECT 1 FROM sync_events WHERE stream_name='wireless.alert.rogue_ap' AND dedupe_key='runtime-2' AND status='completed')",
         &[],
     ).await.unwrap()[0].get(0);
     tx.commit().await.unwrap();
@@ -466,7 +488,10 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
         .unwrap();
 
     assert_eq!(committed.0.load(Ordering::SeqCst), 6);
-    assert!(!supervisor.ready(),"terminated consumers cannot remain ready");
+    assert!(
+        !supervisor.ready(),
+        "terminated consumers cannot remain ready"
+    );
     // Restart the same five groups and prove only the newly appended heartbeat
     // is handled; prior broker coordinates remain one durable receipt each.
     let backpressure = Backpressure::new(fixture.runtime.clone(), 100, 4).unwrap();

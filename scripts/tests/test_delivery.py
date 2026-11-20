@@ -126,8 +126,12 @@ if args[0] == os.environ.get('FAIL_DOCKER_COMMAND'):
         self.assertEqual(17, result.returncode, result.stderr)
         calls = self.calls()
         copies = [args for args in calls if args[0] == "cp"]
-        self.assertEqual(len(copies), 1)
-        self.assertIn("octopus-coverage", copies[0][1])
+        run = next(args for args in calls if args[0] == "run")
+        container = run[run.index("--name") + 1]
+        self.assertEqual(copies, [[
+            "cp", f"{container}:/workspace/artifacts/octopus-coverage/.",
+            "artifacts/octopus-coverage/",
+        ]])
         self.assertLess(calls.index(copies[0]), next(i for i, args in enumerate(calls) if args[0] == "rm"))
 
     def test_artifact_copy_failure_is_preserved_during_cleanup(self) -> None:

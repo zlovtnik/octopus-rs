@@ -8,7 +8,7 @@ use crate::{
         BrokerRecordMetadata, IngestionDecision, IngestionDisposition, ResolvedScanRequestRecord,
     },
     postgres::{PgError, PgRuntime, PgTransaction, PostgresErrorClass},
-    util::{java_is_blank, stable_uuid, utf16_length},
+    util::{java_is_blank, java_trim, stable_uuid, utf16_length},
 };
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
@@ -43,11 +43,25 @@ impl IntakeError {
 #[derive(Clone)]
 pub struct IngestionStore {
     runtime: Arc<PgRuntime>,
+    load_streams: Option<Arc<HashSet<String>>>,
 }
 
 impl IngestionStore {
     pub fn new(runtime: Arc<PgRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            load_streams: None,
+        }
+    }
+
+    pub(crate) fn with_load_streams(mut self, streams: &[String]) -> Self {
+        self.load_streams = Some(Arc::new(
+            streams
+                .iter()
+                .map(|stream| java_trim(stream).to_owned())
+                .collect(),
+        ));
+        self
     }
 
     pub async fn record_scan_request_with_evidence(
@@ -131,7 +145,13 @@ impl IngestionStore {
         let mut transaction = self.runtime.begin_worker().await?;
         let mut decisions = Vec::with_capacity(records.len());
         for (record, metadata) in records {
-            decisions.push(ingest(&mut transaction, record, *metadata).await?);
+            let stream = record.source().stream_name();
+            let create_batch = load_eligible(stream)
+                && self
+                    .load_streams
+                    .as_ref()
+                    .is_none_or(|streams| streams.contains(stream));
+            decisions.push(ingest(&mut transaction, record, *metadata, create_batch).await?);
         }
         transaction.commit().await?;
         Ok(decisions)
@@ -215,6 +235,7 @@ async fn ingest(
     tx: &mut PgTransaction,
     record: &ResolvedScanRequestRecord,
     metadata: Option<&BrokerRecordMetadata>,
+    create_batch: bool,
 ) -> Result<IngestionDecision, IntakeError> {
     validate(record, metadata)?;
     let source = record.source();
@@ -258,11 +279,7 @@ async fn ingest(
             )
             .await?[0]
             .get(0);
-        let status = if load_eligible(stream) {
-            "batched"
-        } else {
-            "completed"
-        };
+        let status = if create_batch { "batched" } else { "completed" };
         tx.execute("INSERT INTO sync_events (dedupe_key,stream_name,observed_at,payload_ref,payload,payload_sha256,status,attempt_count,last_error,producer,event_kind,created_at,updated_at) VALUES ($1,$2,CAST($3 AS text)::timestamptz,$4,CAST($5 AS text)::jsonb,$6,$7,1,NULL,'ssl-proxy',$8,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(dedupe_key,stream_name) DO UPDATE SET dedupe_key=sync_events.dedupe_key",
             &[&key,&stream,&source.observed_at(),&source.payload_ref(),&record.payload_json(),&record.event_payload_sha256(),&status,&event_kind]).await?;
         let stored_hash: Option<String> = tx.query("SELECT payload_sha256 FROM sync_events WHERE stream_name=$1 AND dedupe_key=$2 FOR UPDATE", &[&stream,&key]).await?[0].get(0);
@@ -278,7 +295,7 @@ async fn ingest(
         if stream == "wireless.sensor.heartbeat" {
             upsert_heartbeat(tx, record).await?;
         }
-        if load_eligible(stream) {
+        if create_batch {
             tx.execute("INSERT INTO sync_jobs(job_id,stream_name,dedupe_key,status,attempt_count,created_at) VALUES ($1,$2,$3,'pending',0,CURRENT_TIMESTAMP) ON CONFLICT(dedupe_key,stream_name) DO UPDATE SET job_id=sync_jobs.job_id", &[&job_id,&stream,&key]).await?;
             let persisted_job: String = tx
                 .query(

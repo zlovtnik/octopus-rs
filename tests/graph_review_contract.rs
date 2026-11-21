@@ -95,6 +95,20 @@ async fn graph_limit_tracks_fresh_evidence_and_repairs_older_changes() {
         FROM atheros_search.graph_nodes WHERE node_id = 'ap:12:00:00:00:00:02'",
     )
     .await;
+
+    // An unfinished pair can straddle a completed pair's latest observation.
+    fixture.admin(
+        "INSERT INTO octopus_core.wireless_frames(dedupe_key, source_mac, bssid, observed_at) VALUES
+         ('new-pair', '02:00:00:00:00:01', '12:00:00:00:00:03', '2026-09-20 13:15:00+00'),
+         ('older-fresh', '02:00:00:00:00:02', '12:00:00:00:00:02', '2026-09-20 13:20:00+00')",
+    );
+    store.project_infrastructure_graph(1).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT coverage_status = 'partial' AND projection_watermark_at IS NULL
+        FROM atheros_search.investigation_watermarks WHERE projection_name = 'graph_projection'",
+    )
+    .await;
 }
 
 #[tokio::test]

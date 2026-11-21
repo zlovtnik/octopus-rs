@@ -717,12 +717,13 @@ pub(super) const DELETE_ORPHANED_EDGES: &str = r#"DELETE FROM atheros_search.gra
 // Parameters:
 pub(super) const UPSERT_GRAPH_PROJECTION_WATERMARK: &str = r#"WITH retained_pairs AS MATERIALIZED (
                                 SELECT source_mac, bssid, MAX(observed_at) AS observed_at,
+                                       MIN(observed_at) AS first_observed_at,
                                        COUNT(*) AS frame_count
                                 FROM wireless_frames
                                 WHERE source_mac IS NOT NULL AND bssid IS NOT NULL
                                 GROUP BY source_mac,bssid
                               ), classified AS (
-                                SELECT pair.source_mac, pair.observed_at,
+                                SELECT pair.source_mac, pair.observed_at, pair.first_observed_at,
                                        COALESCE(edge.observed_at >= pair.observed_at
                                              AND edge.weight = pair.frame_count::double precision
                                              AND edge.evidence->'frame_count' = to_jsonb(pair.frame_count), FALSE) AS current
@@ -735,7 +736,7 @@ pub(super) const UPSERT_GRAPH_PROJECTION_WATERMARK: &str = r#"WITH retained_pair
                                        COUNT(*) AS pair_count,
                                        COUNT(DISTINCT source_mac) AS mac_count,
                                        COUNT(*) FILTER (WHERE current) AS current_count,
-                                       MIN(observed_at) FILTER (WHERE NOT current) AS first_gap_at
+                                       MIN(first_observed_at) FILTER (WHERE NOT current) AS first_gap_at
                                 FROM classified
                               ),
                               projection AS (

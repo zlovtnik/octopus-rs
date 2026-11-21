@@ -62,7 +62,8 @@ pub async fn run(config: AppConfig) -> Result {
 }
 
 async fn start(config: AppConfig, stop: CancellationToken, tasks: &mut JoinSet<Result>) -> Result {
-    let enabled = selected_processors(&config.processors.enabled, config.runtime.consumers_enabled)?;
+    let enabled =
+        selected_processors(&config.processors.enabled, config.runtime.consumers_enabled)?;
     workloads::validate(&enabled)?;
     let db = Arc::new(PgRuntime::connect(&config.postgres).await?);
     let metrics = Metrics::with_rate_window(config.public_stats.rate_window_seconds)?;
@@ -71,7 +72,13 @@ async fn start(config: AppConfig, stop: CancellationToken, tasks: &mut JoinSet<R
         config.cron.ingest_batch_size,
         config.backpressure.budget_multiplier,
     )?;
-    let workloads = workloads::build(&config, &enabled, db.clone(), backpressure.clone(), &metrics)?;
+    let workloads = workloads::build(
+        &config,
+        &enabled,
+        db.clone(),
+        backpressure.clone(),
+        &metrics,
+    )?;
     let ids: Vec<_> = workloads.iter().map(|workload| workload.id).collect();
     select_workloads(&enabled, &ids)?;
     let has_backpressure = enabled.contains(&ProcessorId::SyncJobPlanner);
@@ -97,7 +104,13 @@ async fn start(config: AppConfig, stop: CancellationToken, tasks: &mut JoinSet<R
     octopus::dispatch::DispatchStore::new(db.clone())
         .ensure_cursors(&config.ingest.stream_names)
         .await?;
-    let listener = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, config.http.port as u16)).await?;
+    if has_backpressure {
+        runtime::Planner::new(db.clone(), &config)
+            .reconcile_excluded_pending()
+            .await?;
+    }
+    let listener =
+        TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, config.http.port as u16)).await?;
     let supervisor = Supervisor::create(config.processors.clone(), enabled, db.clone()).await?;
     let health = HealthChecks {
         database: {

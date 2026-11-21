@@ -54,7 +54,8 @@ impl IngestionStore {
         }
     }
 
-    pub(crate) fn with_load_streams(mut self, streams: &[String]) -> Self {
+    /// Limit batch creation to the streams configured for load dispatch.
+    pub fn with_load_streams(mut self, streams: &[String]) -> Self {
         self.load_streams = Some(Arc::new(
             streams
                 .iter()
@@ -324,7 +325,14 @@ async fn ingest(
             } else {
                 key.into()
             };
-            tx.execute("INSERT INTO sync_batches(batch_id,job_id,batch_no,payload_ref,status,row_count,attempt_count,dedupe_key,stream_name,cursor_start,cursor_end,created_at,updated_at) VALUES ($1,$2,0,$3,'pending',1,0,$4,$5,$6,$7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(dedupe_key,stream_name) DO UPDATE SET batch_id=sync_batches.batch_id",
+            tx.execute("WITH new_batch AS (
+                INSERT INTO sync_batches(batch_id,job_id,batch_no,payload_ref,status,row_count,attempt_count,dedupe_key,stream_name,cursor_start,cursor_end,created_at,updated_at)
+                VALUES ($1,$2,0,$3,'pending',1,0,$4,$5,$6,$7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                ON CONFLICT(dedupe_key,stream_name) DO NOTHING
+                RETURNING 1
+            )
+            UPDATE sync_events SET status='batched',updated_at=CURRENT_TIMESTAMP
+            WHERE dedupe_key=$4 AND stream_name=$5 AND status<>'batched' AND EXISTS (SELECT 1 FROM new_batch)",
                 &[&batch_id,&persisted_job,&source.payload_ref(),&key,&stream,&cursor,&cursor_end]).await?;
         }
         let disposition = if existed {

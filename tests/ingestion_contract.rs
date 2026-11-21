@@ -83,6 +83,56 @@ fn typed_stream_aliases_and_unknown_intake_are_distinct() {
     }
 }
 
+#[tokio::test]
+async fn later_delivery_creates_first_batch_for_newly_enabled_stream() {
+    let Some(fixture) = Fixture::start().await else {
+        return;
+    };
+    let stream = "wireless.alert.rogue_ap";
+    let event = record(stream, "newly-enabled", "{}", "2026-11-01T00:00:00Z");
+    let store = IngestionStore::new(fixture.runtime.clone());
+    let status = || async {
+        let mut tx = fixture.runtime.begin_worker().await.unwrap();
+        let rows = tx.query(
+            "SELECT e.status,b.status FROM sync_events e LEFT JOIN sync_batches b USING (stream_name,dedupe_key) WHERE e.stream_name=$1 AND e.dedupe_key=$2",
+            &[&stream, &event.source().dedupe_key()],
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        (
+            rows[0].get::<_, String>(0),
+            rows[0].get::<_, Option<String>>(1),
+        )
+    };
+
+    let excluded = store.clone().with_load_streams(&["proxy.events".into()]);
+    excluded
+        .record_scan_request_with_evidence(&event, &metadata(&event, 1))
+        .await
+        .unwrap();
+    assert_eq!(status().await, ("completed".into(), None));
+
+    let enabled = store.with_load_streams(&["proxy.events".into(), stream.into()]);
+    let admitted = enabled
+        .record_scan_request_with_evidence(&event, &metadata(&event, 2))
+        .await
+        .unwrap();
+    assert_eq!(admitted.disposition, IngestionDisposition::Deduplicated);
+    assert_eq!(status().await, ("batched".into(), Some("pending".into())));
+
+    fixture.admin("UPDATE octopus_core.sync_batches SET status='completed'; UPDATE octopus_core.sync_events SET status='completed'");
+    let replay = enabled
+        .record_scan_request_with_evidence(&event, &metadata(&event, 3))
+        .await
+        .unwrap();
+    assert_eq!(replay.disposition, IngestionDisposition::Deduplicated);
+    assert_eq!(replay.batch_id, admitted.batch_id);
+    assert_eq!(
+        status().await,
+        ("completed".into(), Some("completed".into()))
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn canonical_intake_is_atomic_replay_safe_and_monotonic() {
     let Some(fixture) = Fixture::start().await else {

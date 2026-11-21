@@ -568,7 +568,9 @@ pub fn consumer_workloads_observed(
     let kafka = &cfg.kafka;
     let mut workloads = Vec::new();
     let scan = ScanHandler {
-        store: ingestion.clone(),
+        store: ingestion
+            .clone()
+            .with_load_streams(&cfg.ingest.load_stream_names),
         outbox: cfg.sync.outbox_dir.clone().into(),
         projection_only: cfg.wireless.projection.mode == "projected",
         parking: Parking::new(kafka, &kafka.scan_consumer, &kafka.scan_topic)?,
@@ -679,7 +681,10 @@ pub async fn schema_refresher(
             match result {
                 Ok(()) => break,
                 Err(error)
-                    if matches!(error,crate::postgres::PgError::Acquisition|crate::postgres::PgError::Deadline) || crate::postgres::PostgresErrorClass::classify(&error)
+                    if matches!(
+                        error,
+                        crate::postgres::PgError::Acquisition | crate::postgres::PgError::Deadline
+                    ) || crate::postgres::PostgresErrorClass::classify(&error)
                         == crate::postgres::PostgresErrorClass::Retryable =>
                 {
                     tokio::select! {_=stop.cancelled()=>return Ok(()),_=tokio::time::sleep(retry)=>{}}
@@ -751,7 +756,10 @@ impl OutboxPublisher {
         let batch = match record.load_batch_id() {
             Ok(batch) => batch,
             Err(error) => {
-                self.store.park_malformed(&record, &error.to_string()).await.map_err(load_workload)?;
+                self.store
+                    .park_malformed(&record, &error.to_string())
+                    .await
+                    .map_err(load_workload)?;
                 return Ok(DispatchOutcome::ContinueDraining);
             }
         };
@@ -826,7 +834,7 @@ impl OutboxPublisher {
         )
     }
 }
-fn load_workload(error: LoadError) -> WorkloadError {
+pub fn load_workload(error: LoadError) -> WorkloadError {
     if error.is_invariant() || error.is_retryable() {
         WorkloadError::Retryable(crate::errors::sanitize(&error.to_string()))
     } else {

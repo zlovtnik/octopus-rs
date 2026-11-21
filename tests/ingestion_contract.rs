@@ -1,5 +1,4 @@
 use octopus::{
-    config::PostgresConfig,
     domain::{
         BrokerConsumerContract, BrokerRecordMetadata, IngestionDisposition,
         ResolvedScanRequestRecord, ScanRequestRecord,
@@ -8,228 +7,8 @@ use octopus::{
     postgres::PgRuntime,
     util::sha256_hex,
 };
-use std::{
-    path::PathBuf,
-    process::{Command, Output},
-    sync::Arc,
-    time::Duration,
-};
-
-const IMAGE: &str = "pgvector/pgvector:0.8.6-pg16-bookworm@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b";
-
-fn checked(command: &mut Command) -> Output {
-    let output = command.output().expect("test command must start");
-    assert!(
-        output.status.success(),
-        "test fixture command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-struct Fixture {
-    name: String,
-    network: String,
-    directory: tempfile::TempDir,
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", "-v", &self.name])
-            .output();
-        let _ = Command::new("docker")
-            .args(["network", "rm", &self.network])
-            .output();
-    }
-}
-impl Fixture {
-    async fn start() -> Option<(Self, Arc<PgRuntime>)> {
-        let available = Command::new("docker")
-            .arg("info")
-            .output()
-            .is_ok_and(|out| out.status.success());
-        if !available {
-            assert_ne!(
-                std::env::var("OCTOPUS_REQUIRE_DOCKER").as_deref(),
-                Ok("true"),
-                "required Docker is unavailable"
-            );
-            eprintln!("Docker unavailable; native ingestion integration not exercised");
-            return None;
-        }
-        let name = format!("native-intake-{}", uuid::Uuid::new_v4());
-        let fixture = Self {
-            network: format!("{name}-net"),
-            name,
-            directory: tempfile::tempdir().unwrap(),
-        };
-        checked(Command::new("docker").args(["network", "create", &fixture.network]));
-        checked(Command::new("docker").args([
-            "run",
-            "-d",
-            "--name",
-            &fixture.name,
-            "--network",
-            &fixture.network,
-            "-e",
-            "POSTGRES_PASSWORD=integration-admin",
-            "-e",
-            "POSTGRES_DB=sync",
-            "-p",
-            "127.0.0.1::5432",
-            IMAGE,
-        ]));
-        let mut ready = false;
-        for _ in 0..120 {
-            if Command::new("docker")
-                .args([
-                    "exec",
-                    &fixture.name,
-                    "pg_isready",
-                    "-h",
-                    "127.0.0.1",
-                    "-U",
-                    "postgres",
-                    "-d",
-                    "sync",
-                ])
-                .output()
-                .is_ok_and(|out| out.status.success())
-            {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        assert!(ready, "scratch database did not start");
-        fixture.admin("CREATE EXTENSION pgcrypto; CREATE EXTENSION vector; CREATE EXTENSION pg_stat_statements; CREATE ROLE schema_owner LOGIN PASSWORD 'integration-schema-owner'; CREATE ROLE octopus_runtime LOGIN PASSWORD 'integration-runtime'; CREATE ROLE atheros_search_runtime LOGIN; CREATE ROLE schema_migrator_runtime LOGIN; CREATE ROLE keycloak_runtime LOGIN; GRANT CREATE ON DATABASE sync TO schema_owner;");
-        fixture.admin("ALTER ROLE octopus_runtime IN DATABASE sync SET search_path TO octopus_core, atheros_search; ALTER ROLE atheros_search_runtime IN DATABASE sync SET search_path TO atheros_search; ALTER ROLE schema_migrator_runtime IN DATABASE sync SET search_path TO schema_migrator; ALTER ROLE keycloak_runtime IN DATABASE sync SET search_path TO keycloak;");
-        fixture.provision();
-        let output = checked(Command::new("docker").args(["port", &fixture.name, "5432/tcp"]));
-        let port = String::from_utf8(output.stdout)
-            .unwrap()
-            .trim()
-            .rsplit(':')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap();
-        let manifest =
-            std::fs::read_to_string(root.join("sql/postgres/octopus_core/manifest.yaml")).unwrap();
-        let checksum = manifest
-            .lines()
-            .find_map(|line| line.strip_prefix("manifest_sha256: "))
-            .unwrap()
-            .to_string();
-        let cfg = PostgresConfig {
-            enabled: true,
-            host: "127.0.0.1".into(),
-            port,
-            user: "octopus_runtime".into(),
-            password: "integration-runtime".into(),
-            database: "sync".into(),
-            ssl_mode: "disable".into(),
-            manifest_sha256: checksum,
-            pool_size: 4,
-            healthcheck_reserve: 1,
-            ..PostgresConfig::default()
-        };
-        let runtime = Arc::new(
-            PgRuntime::connect(&cfg)
-                .await
-                .expect("canonical executor must satisfy native preflight"),
-        );
-        Some((fixture, runtime))
-    }
-
-    fn admin(&self, sql: &str) {
-        checked(Command::new("docker").args([
-            "exec",
-            &self.name,
-            "psql",
-            "-U",
-            "postgres",
-            "-d",
-            "sync",
-            "--set=ON_ERROR_STOP=1",
-            "--command",
-            sql,
-        ]));
-    }
-
-    fn provision(&self) {
-        use std::os::unix::fs::PermissionsExt;
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap();
-        let path = self.directory.path();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let bin = path.join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let wrapper = bin.join("psql");
-        std::fs::write(
-            &wrapper,
-            "#!/bin/sh\nPGSSLMODE=disable exec /usr/bin/psql \"$@\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(wrapper, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let ca = path.join("ca.crt");
-        std::fs::write(&ca, "integration-test-placeholder\n").unwrap();
-        std::fs::set_permissions(ca, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let mut command = Command::new("docker");
-        command.args([
-            "run",
-            "--rm",
-            "--network",
-            &self.network,
-            "--user",
-            "65532:65532",
-            "--read-only",
-            "--tmpfs",
-            "/tmp:rw,noexec,nosuid,size=67108864",
-        ]);
-        for (key, value) in [
-            (
-                "PATH",
-                "/test-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            ),
-            ("POSTGRES_HOST", self.name.as_str()),
-            ("POSTGRES_PORT", "5432"),
-            ("POSTGRES_DATABASE", "sync"),
-            ("POSTGRES_SCHEMA_OWNER_USER", "schema_owner"),
-            ("POSTGRES_SCHEMA_OWNER_PASSWORD", "integration-schema-owner"),
-            ("POSTGRES_OCTOPUS_ACCOUNT", "octopus_runtime"),
-            ("POSTGRES_ATHEROS_SEARCH_ACCOUNT", "atheros_search_runtime"),
-            (
-                "POSTGRES_SCHEMA_MIGRATOR_ACCOUNT",
-                "schema_migrator_runtime",
-            ),
-            ("POSTGRES_KEYCLOAK_ACCOUNT", "keycloak_runtime"),
-            ("PGSSLMODE", "verify-full"),
-            ("POSTGRES_SSL_SERVER_NAME", self.name.as_str()),
-            ("PGSSLROOTCERT", "/test-ca/ca.crt"),
-        ] {
-            command.args(["--env", &format!("{key}={value}")]);
-        }
-        command.args([
-            "--volume",
-            &format!("{}:/workspace:ro", root.display()),
-            "--volume",
-            &format!("{}:/test-bin:ro", bin.display()),
-            "--volume",
-            &format!("{}:/test-ca:ro", path.display()),
-            "--entrypoint",
-            "/workspace/k8s/postgres-schema-executor/entrypoint.sh",
-            IMAGE,
-        ]);
-        checked(&mut command);
-    }
-}
+mod support;
+use support::Fixture;
 
 fn record(stream: &str, key: &str, payload: &str, time: &str) -> ResolvedScanRequestRecord {
     let wire=serde_json::json!({"stream_name":stream,"dedupe_key":key,"payload_ref":payload,"observed_at":time}).to_string();
@@ -304,11 +83,62 @@ fn typed_stream_aliases_and_unknown_intake_are_distinct() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn canonical_intake_is_atomic_replay_safe_and_monotonic() {
-    let Some((fixture, runtime)) = Fixture::start().await else {
+#[tokio::test]
+async fn later_delivery_creates_first_batch_for_newly_enabled_stream() {
+    let Some(fixture) = Fixture::start().await else {
         return;
     };
+    let stream = "wireless.alert.rogue_ap";
+    let event = record(stream, "newly-enabled", "{}", "2026-11-01T00:00:00Z");
+    let store = IngestionStore::new(fixture.runtime.clone());
+    let status = || async {
+        let mut tx = fixture.runtime.begin_worker().await.unwrap();
+        let rows = tx.query(
+            "SELECT e.status,b.status FROM sync_events e LEFT JOIN sync_batches b USING (stream_name,dedupe_key) WHERE e.stream_name=$1 AND e.dedupe_key=$2",
+            &[&stream, &event.source().dedupe_key()],
+        ).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        (
+            rows[0].get::<_, String>(0),
+            rows[0].get::<_, Option<String>>(1),
+        )
+    };
+
+    let excluded = store.clone().with_load_streams(&["proxy.events".into()]);
+    excluded
+        .record_scan_request_with_evidence(&event, &metadata(&event, 1))
+        .await
+        .unwrap();
+    assert_eq!(status().await, ("completed".into(), None));
+
+    let enabled = store.with_load_streams(&["proxy.events".into(), stream.into()]);
+    let admitted = enabled
+        .record_scan_request_with_evidence(&event, &metadata(&event, 2))
+        .await
+        .unwrap();
+    assert_eq!(admitted.disposition, IngestionDisposition::Deduplicated);
+    assert_eq!(status().await, ("batched".into(), Some("pending".into())));
+
+    fixture.admin("UPDATE octopus_core.sync_batches SET status='completed'; UPDATE octopus_core.sync_events SET status='completed'");
+    let replay = enabled
+        .record_scan_request_with_evidence(&event, &metadata(&event, 3))
+        .await
+        .unwrap();
+    assert_eq!(replay.disposition, IngestionDisposition::Deduplicated);
+    assert_eq!(replay.batch_id, admitted.batch_id);
+    assert_eq!(
+        status().await,
+        ("completed".into(), Some("completed".into()))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_intake_is_atomic_replay_safe_and_monotonic() {
+    let Some(fixture) = Fixture::start().await else {
+        return;
+    };
+    let runtime = fixture.runtime.clone();
     let store = IngestionStore::new(runtime.clone());
     let raw = record(
         "custom.raw",

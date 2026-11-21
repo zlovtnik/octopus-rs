@@ -2,7 +2,8 @@
 # The umbrella context supplies the canonical Redpanda topic resources.
 FROM rust:1.100.0-slim-bookworm AS builder
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential cmake pkg-config libssl-dev \
+    && apt-get install -y --no-install-recommends \
+        build-essential cmake libcurl4-openssl-dev libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY services/octopus-rs/Cargo.toml services/octopus-rs/Cargo.lock services/octopus-rs/rust-toolchain.toml ./

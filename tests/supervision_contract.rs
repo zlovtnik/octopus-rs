@@ -3,7 +3,7 @@ mod support;
 use octopus::{
     config::{AppConfig, ProcessorConfig},
     processor::ProcessorId,
-    runtime::Planner,
+    runtime::{Backpressure, Planner},
     supervision::{LeaseStore, ProcessorLifecycle, Supervisor, Workload, WorkloadError},
 };
 use std::{
@@ -32,9 +32,9 @@ async fn legacy_planning_is_atomic_and_completion_repair_resumes_from_checkpoint
         return;
     };
     let mut cfg = AppConfig::default();
-    cfg.ingest.stream_names = vec!["proxy.events".into(), "wireless.audit".into()];
+    cfg.ingest.load_stream_names = vec!["proxy.events".into(), "wireless.audit".into()];
     cfg.cron.ingest_batch_size = 1;
-    fixture.admin("INSERT INTO octopus_core.sync_events(stream_name,dedupe_key,observed_at,payload_ref,status,attempt_count) VALUES('proxy.events','first','2026-11-18T00:00:00Z','inline://json/e30','pending',0),('wireless.audit','second','2026-11-18T00:00:01Z','inline://json/e30','pending',0),('ignored','third','2026-11-18T00:00:02Z','inline://json/e30','pending',0)");
+    fixture.admin("INSERT INTO octopus_core.sync_events(stream_name,dedupe_key,observed_at,payload_ref,status,attempt_count) VALUES('proxy.events','first','2026-11-18T00:00:00Z','inline://json/e30','pending',0),('wireless.audit','second','2026-11-18T00:00:01Z','inline://json/e30','pending',0),('wireless.alert.rogue_ap','third','2026-11-18T00:00:02Z','inline://json/e30','pending',0)");
     let planner = Planner::new(fixture.runtime.clone(), &cfg);
     assert_eq!(planner.process_ingest().await.unwrap(), 1);
     assert_eq!(planner.process_ingest().await.unwrap(), 1);
@@ -47,6 +47,7 @@ async fn legacy_planning_is_atomic_and_completion_repair_resumes_from_checkpoint
     assert_eq!(rows[0].get::<_, String>(4), "first");
     assert_eq!(rows[1].get::<_, String>(4), "1794960001");
     assert_eq!(rows[2].get::<_, String>(1), "pending");
+    assert_eq!(rows[2].get::<_, Option<String>>(4), None);
     tx.commit().await.unwrap();
     fixture.admin("UPDATE octopus_core.sync_batches SET status='completed';UPDATE octopus_core.sync_jobs SET status='completed'");
     assert_eq!(planner.reconcile_completed_events().await.unwrap(), 1);
@@ -66,6 +67,49 @@ async fn legacy_planning_is_atomic_and_completion_repair_resumes_from_checkpoint
     let rows=tx.query("SELECT status,rows_processed FROM processor_checkpoints WHERE processor_name='sync-backlog-recovery' AND shard_id='event-completion-v1'",&[]).await.unwrap();
     assert_eq!(rows[0].get::<_, String>(0), "healthy");
     assert_eq!(rows[0].get::<_, i64>(1), 2);
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn excluded_pending_events_without_active_batches_release_backpressure() {
+    let Some(fixture) = support::Fixture::start().await else {
+        return;
+    };
+    let mut cfg = AppConfig::default();
+    cfg.ingest.load_stream_names = vec!["proxy.events".into()];
+    cfg.cron.ingest_batch_size = 1;
+    fixture.admin("INSERT INTO octopus_core.sync_events(stream_name,dedupe_key,observed_at,payload_ref)
+        VALUES ('proxy.events','allowed',CURRENT_TIMESTAMP,'inline://json/e30'),
+               ('wireless.audit','active',CURRENT_TIMESTAMP,'inline://json/e30'),
+               ('wireless.audit','finished',CURRENT_TIMESTAMP,'inline://json/e30'),
+               ('wireless.audit','unbatched',CURRENT_TIMESTAMP,'inline://json/e30');
+        INSERT INTO octopus_core.sync_jobs(job_id,stream_name,dedupe_key,status)
+        VALUES ('active','wireless.audit','active','pending'),
+               ('finished','wireless.audit','finished','completed');
+        INSERT INTO octopus_core.sync_batches(batch_id,job_id,stream_name,dedupe_key,payload_ref,cursor_start,cursor_end,status)
+        VALUES ('active','active','wireless.audit','active','inline://json/e30','0','1','pending'),
+               ('finished','finished','wireless.audit','finished','inline://json/e30','0','1','completed')");
+
+    let backpressure = Backpressure::new(fixture.runtime.clone(), 4, 1).unwrap();
+    assert_eq!(backpressure.check_and_act().await.unwrap(), 4);
+    assert!(backpressure.suspended());
+
+    let planner = Planner::new(fixture.runtime.clone(), &cfg);
+    assert_eq!(planner.reconcile_excluded_pending().await.unwrap(), 2);
+    assert_eq!(planner.reconcile_excluded_pending().await.unwrap(), 0);
+    assert_eq!(backpressure.check_and_act().await.unwrap(), 2);
+    assert!(!backpressure.suspended());
+
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    let rows = tx
+        .query(
+            "SELECT dedupe_key FROM sync_events WHERE status='pending' ORDER BY dedupe_key",
+            &[],
+        )
+        .await
+        .unwrap();
+    let pending: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(pending, ["active", "allowed"]);
     tx.commit().await.unwrap();
 }
 
@@ -155,7 +199,11 @@ async fn canonical_runtime_restarts_records_cancellation_and_rejects_stale_fence
         .unwrap()
         .contains("do-not-retain"));
     stop.cancel();
-    tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 
     let leases = LeaseStore::new(runtime.clone());
     let first = leases
@@ -241,7 +289,11 @@ async fn canonical_runtime_restarts_records_cancellation_and_rejects_stale_fence
     .await
     .unwrap();
     stop.cancel();
-    assert!(tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().is_err());
+    assert!(tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
     assert!(leases
         .acquire("processor", id.as_str(), "owner-d", 60)
         .await

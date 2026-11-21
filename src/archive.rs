@@ -162,7 +162,8 @@ impl PayloadArchiver {
         for candidate in candidates {
             match self.objects.archive(&candidate).await {
                 Ok(receipt) => {
-                    self.record_archive_fenced(&candidate, &receipt, lease).await?;
+                    self.record_archive_fenced(&candidate, &receipt, lease)
+                        .await?;
                     archived += 1;
                     archived_one();
                 }

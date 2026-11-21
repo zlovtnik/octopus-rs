@@ -2,7 +2,8 @@ pipeline {
   agent any
   parameters {
     booleanParam(name: 'RUN_NATIVE', defaultValue: false,
-      description: 'Require native tests, coverage and release artifact; fails until runtime inputs exist')
+      description: 'Require native tests, coverage and release artifact')
+    string(name: 'PARENT_REVISION', defaultValue: '', description: 'For standalone native builds, the full ssl-proxy commit pinning this checkout')
   }
   options {
     buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
@@ -33,9 +34,31 @@ pipeline {
       when { expression { params.RUN_NATIVE } }
       options { timeout(time: 75, unit: 'MINUTES') }
       steps {
+        script {
+          if (env.OCTOPUS_RUST_DIR == '.') {
+            if (!(params.PARENT_REVISION ==~ /[0-9a-f]{40}/)) {
+              error('Standalone native validation requires PARENT_REVISION')
+            }
+            dir('umbrella-fixtures') {
+              checkout([$class: 'GitSCM', branches: [[name: params.PARENT_REVISION]],
+                        userRemoteConfigs: [[url: 'https://github.com/zlovtnik/ssl-proxy.git']]])
+              env.OCTOPUS_UMBRELLA_ROOT = pwd()
+            }
+            sh 'test "$(git rev-parse HEAD)" = "$(git -C "$OCTOPUS_UMBRELLA_ROOT" rev-parse HEAD:services/octopus-rs)"'
+          } else {
+            sh 'python3 scripts/octopus_image_contract.py source --native'
+          }
+        }
         dir(env.OCTOPUS_RUST_DIR) {
           sh 'bash scripts/ci/native.sh'
           archiveArtifacts artifacts: 'artifacts/octopus-coverage/**,artifacts/octopus', fingerprint: true
+        }
+      }
+      post {
+        unsuccessful {
+          dir(env.OCTOPUS_RUST_DIR) {
+            archiveArtifacts artifacts: 'artifacts/octopus-coverage/**', allowEmptyArchive: true
+          }
         }
       }
     }

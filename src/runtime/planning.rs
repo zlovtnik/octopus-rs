@@ -5,6 +5,7 @@ use crate::{
     dispatch::DispatchStore,
     load::LoadError,
     postgres::{PgError, PgRuntime},
+    util::java_trim,
 };
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -24,9 +25,9 @@ impl Planner {
     pub fn new(runtime: Arc<PgRuntime>, cfg: &AppConfig) -> Self {
         let streams = cfg
             .ingest
-            .stream_names
+            .load_stream_names
             .iter()
-            .map(|s| s.trim())
+            .map(|s| java_trim(s))
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect::<BTreeSet<_>>()
@@ -38,6 +39,36 @@ impl Planner {
             streams,
         }
     }
+
+    /// Close excluded ledger entries before startup begins sampling backpressure.
+    pub async fn reconcile_excluded_pending(&self) -> Result<u64, PgError> {
+        let limit = i64::from(self.cron.ingest_batch_size.clamp(1, 1000));
+        let mut reconciled = 0;
+        loop {
+            let mut tx = self.runtime.begin_worker().await?;
+            let changed = tx
+                .execute(
+                    "WITH candidates AS (
+                SELECT e.stream_name,e.dedupe_key FROM sync_events e
+                WHERE e.status='pending' AND e.stream_name<>ALL($1)
+                  AND NOT EXISTS (SELECT 1 FROM sync_batches b
+                    WHERE b.stream_name=e.stream_name AND b.dedupe_key=e.dedupe_key
+                      AND b.status NOT IN ('completed','failed','cancelled'))
+                ORDER BY e.stream_name,e.dedupe_key LIMIT $2 FOR UPDATE OF e
+            )
+            UPDATE sync_events e SET status='completed',last_error=NULL,updated_at=CURRENT_TIMESTAMP
+            FROM candidates c WHERE e.stream_name=c.stream_name AND e.dedupe_key=c.dedupe_key",
+                    &[&self.streams, &limit],
+                )
+                .await?;
+            tx.commit().await?;
+            reconciled += changed;
+            if changed < limit as u64 {
+                return Ok(reconciled);
+            }
+        }
+    }
+
     /// A full source batch is locked and planned atomically. Backpressure pauses
     /// producers, while this method continues draining already admitted events.
     pub async fn process_ingest(&self) -> Result<u64, PgError> {

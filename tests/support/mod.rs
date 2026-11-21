@@ -199,6 +199,9 @@ impl Fixture {
 }
 
 pub fn repository_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("OCTOPUS_TEST_ROOT") {
+        return PathBuf::from(root);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
@@ -222,9 +225,24 @@ fn provision(name: &str, network: &str, directory: &tempfile::TempDir) {
     let ca = path.join("ca.crt");
     std::fs::write(&ca, "integration-test-placeholder\n").unwrap();
     std::fs::set_permissions(ca, std::fs::Permissions::from_mode(0o444)).unwrap();
+    // The Docker daemon may be outside the test runner's mount namespace.
+    // Send just the executor inputs over stdin, never daemon-host bind paths.
+    let archive = path.join("schema.tar");
+    checked(
+        Command::new("tar")
+            .arg("-cf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&root)
+            .args(["sql/postgres", "k8s/postgres-schema-executor/entrypoint.sh"])
+            .arg("-C")
+            .arg(path)
+            .args(["bin/psql", "ca.crt"]),
+    );
     let mut command = Command::new("docker");
     command.args([
         "run",
+        "-i",
         "--rm",
         "--network",
         network,
@@ -237,7 +255,7 @@ fn provision(name: &str, network: &str, directory: &tempfile::TempDir) {
     for (key, value) in [
         (
             "PATH",
-            "/test-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "/workspace/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         ),
         ("POSTGRES_HOST", name),
         ("POSTGRES_PORT", "5432"),
@@ -253,20 +271,19 @@ fn provision(name: &str, network: &str, directory: &tempfile::TempDir) {
         ("POSTGRES_KEYCLOAK_ACCOUNT", "keycloak_runtime"),
         ("PGSSLMODE", "verify-full"),
         ("POSTGRES_SSL_SERVER_NAME", name),
-        ("PGSSLROOTCERT", "/test-ca/ca.crt"),
+        ("PGSSLROOTCERT", "/workspace/ca.crt"),
     ] {
         command.args(["--env", &format!("{key}={value}")]);
     }
     command.args([
-        "--volume",
-        &format!("{}:/workspace:ro", root.display()),
-        "--volume",
-        &format!("{}:/test-bin:ro", bin.display()),
-        "--volume",
-        &format!("{}:/test-ca:ro", path.display()),
+        "--tmpfs",
+        "/workspace:rw,exec,nosuid,uid=65532,gid=65532,size=67108864",
         "--entrypoint",
-        "/workspace/k8s/postgres-schema-executor/entrypoint.sh",
+        "/bin/sh",
         IMAGE,
+        "-ec",
+        "cd /workspace && tar --no-same-owner -xf - && exec sh k8s/postgres-schema-executor/entrypoint.sh",
     ]);
+    command.stdin(std::fs::File::open(archive).unwrap());
     checked(&mut command);
 }

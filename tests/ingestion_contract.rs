@@ -114,11 +114,25 @@ async fn later_delivery_creates_first_batch_for_newly_enabled_stream() {
 
     let enabled = store.with_load_streams(&["proxy.events".into(), stream.into()]);
     let admitted = enabled
-        .record_scan_request_with_evidence(&event, &metadata(&event, 2))
+        .record_scan_request_with_evidence(&event, &metadata(&event, 1))
         .await
         .unwrap();
     assert_eq!(admitted.disposition, IngestionDisposition::Deduplicated);
     assert_eq!(status().await, ("batched".into(), Some("pending".into())));
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    let evidence = tx
+        .query(
+            "SELECT evidence.disposition, offsets.next_offset
+             FROM ingestion_evidence evidence JOIN consumer_offsets offsets
+             USING (topic, partition_id, group_id) WHERE evidence.record_offset=1",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].get::<_, String>(0), "processed");
+    assert_eq!(evidence[0].get::<_, i64>(1), 2);
+    tx.commit().await.unwrap();
 
     fixture.admin("UPDATE octopus_core.sync_batches SET status='completed'; UPDATE octopus_core.sync_events SET status='completed'");
     let replay = enabled

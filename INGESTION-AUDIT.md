@@ -1,12 +1,11 @@
 # Octopus Rust capability migration ledger
 
-> **Status: Native library migration in progress.** Initial library slices and
-> delivery tooling exist. Every runtime capability below remains Scala-owned.
+> **Status: Native Octopus runs in local Compose.** Scala remains the production
+> coordinator and the behavioral reference for migration.
 
-The [Scala capability audit](../octopus/INGESTION-AUDIT.md) is the behavioral
-baseline. Its implementation links and historical test results describe Scala,
-not this native library. No claim of full Rust parity, database readiness or broker handling
-is made here.
+The [Scala capability audit](../octopus/INGESTION-AUDIT.md) records the Scala
+implementation and historical test results. Full parity requires independent
+evidence for the native implementation.
 
 ## Current native slices
 
@@ -23,11 +22,42 @@ build with the [broker-drain workload assembly](src/application/workloads.rs).
 The assembly connects the five consumer lanes, job planner, backlog recovery,
 load dispatch and outbox publisher. Other processor selections fail validation.
 
-Configuration currently binds environment variables and defaults; HOCON file
-and JVM system-property overrides remain unimplemented. Per-slice tests must
+Configuration binds defaults, environment values, HOCON file settings and
+explicit `-D` property overrides in increasing precedence. Per-slice tests must
 preserve UTF-16 consumer-contract hashing, UTF-8 stable UUID identity, raw payload
 hashes, disabled defaults, secret handling, consumer union and ownership rules.
 Successful pure-library checks cannot establish durable intake or DQ parity.
+
+## Local native activation
+
+| Status | Runtime path |
+| --- | --- |
+| Active in [local Compose](../../docker-compose.yaml) | Scan, load and result consumers, job planner, backlog recovery, load dispatch and outbox publisher. Consumer selection also starts wireless heartbeat ingestion. |
+| Opt-in | Wireless audit projection subscribes in `shadow` and `projected` modes. In the local `legacy` mode the selected workload waits for shutdown. `projected` filters the companion wireless scan requests. DQ starts independently with report receipts, quarantine and retention when enabled. Public stats opt in to the HTTP views and peaks refresh. |
+| Implemented outside native workload assembly | Payload archive, its retention worker and several scheduled graph, inventory and search projection methods have fixture callers. DQ also uses the MinIO client and identity projection helpers. |
+| Search-owned | Embedding execution and embedding lease recovery belong to Atheros Search. Octopus maintains its search documents and can enqueue embedding jobs. |
+
+## Follow a sync record
+
+1. `ScanHandler` resolves `sync.scan.request` and passes the decoded record and
+   original broker payload hash to `IngestionStore`. The transaction checks
+   coordinate and business dedupe, writes the event, and creates eligible job
+   and batch state. `Planner` also processes eligible pending ledger entries.
+   [Runtime adapter](src/runtime.rs), [intake](src/ingestion.rs), [planner](src/runtime/planning.rs).
+2. `DispatchStore` enqueues `sync.oracle.load` in the PostgreSQL outbox.
+   `OutboxPublisher` claims a fenced row, waits for broker acknowledgement, then
+   acknowledges the row and advances dispatch state. Expiry recovery retains
+   the attempt and owner checks. [Dispatch store](src/dispatch.rs), [publisher](src/runtime.rs).
+3. `LoadHandler` authorizes the attempt. Successful typed loads commit their
+   rows and the result outbox together, and the handler records load evidence
+   before finishing. The publisher delivers `sync.oracle.result` through the same
+   acknowledged outbox path. `ResultHandler` applies the fenced result transition
+   and records outcome evidence in one transaction. [Load and result store](src/load.rs).
+4. Each consumer commits the partition's next offset synchronously in
+   `process_batch` after its durable handler and any required, acknowledged DLQ
+   sends. The assignment epoch gates commit. A new group starts at the earliest
+   retained offset. Restarts use broker commits. PostgreSQL records monotonic
+   diagnostic offsets. [Kafka boundary](src/kafka.rs), [evidence write](src/postgres.rs).
 
 [core.sh](scripts/ci/core.sh) validates formatting, Clippy, locked tests and a
 release library build. On 2026-11-18 it passed 62 native tests with Docker required

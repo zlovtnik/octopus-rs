@@ -15,10 +15,11 @@ use octopus::{
         consumer_workloads_observed, Backpressure, OutboxPublisher, Planner, RuntimeError,
         WirelessProjectionHandler,
     },
-    supervision::{LeaseStore, Workload},
+    supervision::{LeaseStore, Workload, WorkloadError},
 };
 use serde_json::Value;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 // Only advertise processors with concrete native runtime wiring.
@@ -46,21 +47,20 @@ pub fn validate(enabled: &BTreeSet<ProcessorId>) -> Result {
 struct Wireless(ProjectionStore);
 
 impl WirelessProjectionHandler for Wireless {
-    fn decode(&self, raw: &str) -> std::result::Result<Value, Poison> {
-        let value =
+    fn decode(&self, raw: &str) -> std::result::Result<WirelessObservation, Poison> {
+        let value: Value =
             serde_json::from_str(raw).map_err(|_| Poison::invalid("invalid wireless JSON"))?;
-        WirelessObservation::from_value(&value).map_err(|e| Poison::invalid(e.to_string()))?;
-        Ok(value)
+        WirelessObservation::from_value(&value).map_err(|e| Poison::invalid(e.to_string()))
     }
 
     fn project(
         &self,
-        value: Value,
+        observation: WirelessObservation,
         metadata: BrokerRecordMetadata,
     ) -> BoxFuture<'_, std::result::Result<(), RuntimeError>> {
         Box::pin(async move {
             self.0
-                .project_wireless_record(value, &metadata)
+                .project_wireless_observation(observation, &metadata)
                 .await
                 .map(|_| ())
                 .map_err(|e| match e {
@@ -133,51 +133,34 @@ pub fn build(
         let planner = Planner::new(db.clone(), config);
         let leases = LeaseStore::new(db.clone());
         let dispatch = dispatch.clone();
-        let streams = config.ingest.load_stream_names.clone();
         let limit = i64::from(config.cron.ingest_batch_size);
         let attempts = config.cron.batch_max_attempts;
         let owner = owner.clone();
         let ttl = (interval * 2).as_secs().max(30) as i32;
         workloads.push(Workload::new(id, move |stop| {
-            let (planner, leases, dispatch, streams, owner) = (
+            let (planner, leases, dispatch, owner) = (
                 planner.clone(),
                 leases.clone(),
                 dispatch.clone(),
-                streams.clone(),
                 owner.clone(),
             );
             Box::pin(async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = stop.cancelled() => return Ok(()),
-                        _ = tokio::time::sleep(interval) => {}
-                    }
+                while wait_for_fenced_tick(interval, &stop).await {
                     let planner = planner.clone();
                     let dispatch = dispatch.clone();
-                    let streams = streams.clone();
                     let result = leases
                         .run_fenced(id, &owner, ttl, stop.clone(), move |_| {
                             Box::pin(async move {
                                 match id {
-                                    ProcessorId::SyncJobPlanner => {
-                                        planner.process_ingest().await?;
-                                    }
+                                    ProcessorId::SyncJobPlanner => planner_tick(&planner).await,
                                     ProcessorId::SyncBacklogRecovery => {
-                                        planner
-                                            .recover_stale_batches()
-                                            .await
-                                            .map_err(octopus::runtime::load_workload)?;
+                                        recovery_tick(&planner).await
                                     }
                                     ProcessorId::SyncLoadDispatch => {
-                                        dispatch
-                                            .enqueue_pending_streams(&streams, limit, attempts)
-                                            .await
-                                            .map_err(octopus::runtime::load_workload)?;
+                                        dispatch_tick(&dispatch, limit, attempts).await
                                     }
                                     _ => unreachable!("scheduled sync processor"),
                                 }
-                                Ok(())
                             })
                         })
                         .await;
@@ -186,15 +169,59 @@ pub fn build(
                     }
                     result?;
                 }
+                Ok(())
             })
         }));
     }
     Ok(workloads)
 }
 
+async fn planner_tick(planner: &Planner) -> std::result::Result<(), WorkloadError> {
+    planner.process_ingest().await?;
+    Ok(())
+}
+
+async fn recovery_tick(planner: &Planner) -> std::result::Result<(), WorkloadError> {
+    planner
+        .recover_stale_batches()
+        .await
+        .map_err(octopus::runtime::load_workload)?;
+    Ok(())
+}
+
+async fn dispatch_tick(
+    dispatch: &DispatchStore,
+    limit: i64,
+    attempts: i32,
+) -> std::result::Result<(), WorkloadError> {
+    dispatch
+        .enqueue_pending(limit, attempts)
+        .await
+        .map_err(octopus::runtime::load_workload)?;
+    Ok(())
+}
+
+async fn wait_for_fenced_tick(interval: Duration, stop: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        _ = stop.cancelled() => false,
+        _ = tokio::time::sleep(interval) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fenced_tick_waits_before_starting_and_observes_cancellation() {
+        let stop = CancellationToken::new();
+        let tick = wait_for_fenced_tick(Duration::from_secs(60), &stop);
+        tokio::pin!(tick);
+        assert!(futures_util::poll!(&mut tick).is_pending());
+        stop.cancel();
+        assert!(!tick.await);
+    }
 
     #[test]
     fn outbox_publisher_requires_backlog_recovery() {

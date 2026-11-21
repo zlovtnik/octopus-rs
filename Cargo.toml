@@ -37,10 +37,10 @@ subtle = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 prometheus = "0.13"
-opentelemetry = "0.31"
-opentelemetry_sdk = "0.31"
+opentelemetry = { version = "0.31", default-features = false, features = ["trace", "internal-logs"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "internal-logs"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-client", "reqwest-rustls"] }
-tracing-opentelemetry = "0.32"
+tracing-opentelemetry = { version = "0.32", default-features = false, features = ["tracing-log"] }
 
 [dev-dependencies]
 tempfile = "3"

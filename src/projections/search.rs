@@ -1,7 +1,9 @@
 use super::{wireless::delete_document,ProjectionError,ProjectionStore};
-use crate::{postgres::PgTransaction,util::{java_is_blank,java_trim,sha256_hex,utf16_length}};
+use crate::{
+    postgres::PgTransaction,
+    util::{java_is_blank, java_name_uuid, java_trim, sha256_hex, utf16_length},
+};
 use chrono::{DateTime,Utc};
-use md5::{Digest,Md5};
 use serde_json::{json,Value};
 use std::collections::{BTreeMap,BTreeSet};
 #[path="search_sql.rs"]mod sql;
@@ -31,9 +33,10 @@ impl SearchSource{
 #[derive(Clone,Debug)]
 pub struct PreparedDocument{pub source:SearchSource,pub document_id:String,pub source_version:i64,pub normalized_text:String,pub normalized_sha256:String,pub title:Option<String>,pub tokens:Vec<(String,f64,i32)>,pub tags:Vec<(String,String)>}
 
-pub fn name_uuid(value:&str)->String{
-    let mut bytes:[u8;16]=Md5::digest(value.as_bytes()).into();bytes[6]=(bytes[6]&0x0f)|0x30;bytes[8]=(bytes[8]&0x3f)|0x80;uuid::Uuid::from_bytes(bytes).to_string()
+pub fn name_uuid(value: &str) -> String {
+    java_name_uuid(value.as_bytes())
 }
+
 pub fn tokenize(normalized:&str)->Vec<String>{
     static TOKEN:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
     TOKEN.get_or_init(||regex::Regex::new("[a-z0-9][a-z0-9:_./-]{0,190}").expect("constant token pattern")).find_iter(normalized).map(|m|m.as_str().into()).collect()
@@ -139,5 +142,25 @@ impl ProjectionStore{
             }
         }
         tx.commit().await?;Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_document_id_frames_lengths_in_utf16_units() {
+        let source = SearchSource::new(
+            SearchKind::DeviceProfile,
+            "a\u{1f600}".into(),
+            DateTime::UNIX_EPOCH,
+            "wireless device".into(),
+            json!({}),
+        );
+        assert_eq!(
+            prepare_source(source).unwrap().document_id,
+            "d59b3175-04c4-3295-926e-c9e0f575de43"
+        );
     }
 }

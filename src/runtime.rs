@@ -14,6 +14,7 @@ use crate::{
     load::{LoadError, LoadStore},
     postgres::PgRuntime,
     processor::ProcessorId,
+    projections::WirelessObservation,
     supervision::{Workload, WorkloadError},
     util::{java_is_blank, sha256_hex, utf16_length},
 };
@@ -55,10 +56,10 @@ impl RuntimeError {
 /// Direct wireless projection keeps its own receipt/hash transaction. The
 /// assembly supplies the production projection implementation, never raw intake.
 pub trait WirelessProjectionHandler: Send + Sync + 'static {
-    fn decode(&self, raw: &str) -> Result<Value, Poison>;
+    fn decode(&self, raw: &str) -> Result<WirelessObservation, Poison>;
     fn project<'a>(
         &'a self,
-        value: Value,
+        observation: WirelessObservation,
         metadata: BrokerRecordMetadata,
     ) -> BoxFuture<'a, Result<(), RuntimeError>>;
 }
@@ -341,10 +342,10 @@ struct WirelessHandler {
     parking: Parking,
     backpressure: Backpressure,
 }
-impl BatchHandler<Value> for WirelessHandler {
+impl BatchHandler<WirelessObservation> for WirelessHandler {
     fn process(
         &self,
-        records: Vec<LockedRecord<Value>>,
+        records: Vec<LockedRecord<WirelessObservation>>,
     ) -> BoxFuture<'_, Result<(), BoundaryError>> {
         Box::pin(async move {
             if records.is_empty() {

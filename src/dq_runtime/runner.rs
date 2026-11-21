@@ -292,9 +292,7 @@ impl DqRuntime {
         .await;
         if let Err(e) = &work {
             let permanent = e.status < 500;
-            let code = if e.code == "source_revision_changed" {
-                e.code.as_str()
-            } else if permanent {
+            let code = if e.code == "source_revision_changed" || permanent {
                 e.code.as_str()
             } else {
                 "preparation_dependency_failure"
@@ -467,15 +465,9 @@ impl DqRuntime {
         let epoch = Arc::new(Mutex::new(0u64));
         let scope = dq::sha256(&json!([self.config.installation_id, self.config.namespace]))?;
         let group = format!("{REPORT_GROUP}-{scope}");
-        let mut cfg = ClientConfig::new();
-        cfg.set("bootstrap.servers", &self.kafka.bootstrap_servers)
-            .set("group.id", &group)
-            .set("auto.offset.reset", "earliest")
-            .set("enable.auto.commit", "false")
-            .set("enable.auto.offset.store", "false")
-            .set("isolation.level", "read_committed")
-            .set("allow.auto.create.topics", "false")
-            .set("max.partition.fetch.bytes", "131072");
+        let mut cfg =
+            crate::kafka::durable_consumer_settings(&self.kafka.bootstrap_servers, &group);
+        cfg.set("max.partition.fetch.bytes", "131072");
         let consumer: StreamConsumer<ReportContext> = cfg
             .create_with_context(ReportContext {
                 epoch: epoch.clone(),

@@ -271,6 +271,28 @@ pub struct AppConfig {
     pub dq: DqConfig,
 }
 
+// Binding order also defines the order of reported configuration errors.
+macro_rules! config_sections {
+    ($apply:ident) => {
+        $apply! {
+            postgres: PostgresConfig = "postgres",
+            kafka: KafkaCfg = "kafka",
+            cron: CronConfig = "cron",
+            ingest: IngestConfig = "ingest",
+            backpressure: BackpressureConfig = "backpressure",
+            http: HttpConfig = "http",
+            public_stats: PublicStatsConfig = "public-stats",
+            sync: SyncConfig = "sync",
+            wireless: WirelessConfig = "wireless",
+            wireless.projection: WirelessProjectionConfig = "wireless.projection",
+            runtime: RuntimeConfig = "runtime",
+            processors: ProcessorConfig = "processors",
+            archive: ArchiveConfig = "archive",
+            dq: DqConfig = "dq",
+        }
+    };
+}
+
 impl RuntimeConfig {
     pub fn any_enabled(&self) -> bool {
         self.processors_enabled || self.consumers_enabled
@@ -351,25 +373,12 @@ impl AppConfig {
     fn bind_config(&mut self, values: &BTreeMap<String, hocon::Value>, explicit: bool) -> Result<(), ConfigError> {
         let mut errors = Vec::new();
         let mut unmatched: BTreeSet<_> = if explicit { values.keys().map(String::as_str).collect() } else { BTreeSet::new() };
-        self.postgres.bind_config("postgres", values, &mut errors, &mut unmatched);
-        self.kafka.bind_config("kafka", values, &mut errors, &mut unmatched);
-        self.cron.bind_config("cron", values, &mut errors, &mut unmatched);
-        self.ingest.bind_config("ingest", values, &mut errors, &mut unmatched);
-        self.backpressure
-            .bind_config("backpressure", values, &mut errors, &mut unmatched);
-        self.http.bind_config("http", values, &mut errors, &mut unmatched);
-        self.public_stats
-            .bind_config("public-stats", values, &mut errors, &mut unmatched);
-        self.sync.bind_config("sync", values, &mut errors, &mut unmatched);
-        self.wireless.bind_config("wireless", values, &mut errors, &mut unmatched);
-        self.wireless
-            .projection
-            .bind_config("wireless.projection", values, &mut errors, &mut unmatched);
-        self.runtime.bind_config("runtime", values, &mut errors, &mut unmatched);
-        self.processors
-            .bind_config("processors", values, &mut errors, &mut unmatched);
-        self.archive.bind_config("archive", values, &mut errors, &mut unmatched);
-        self.dq.bind_config("dq", values, &mut errors, &mut unmatched);
+        macro_rules! bind_sections {
+            ($($($field:ident).+: $ty:ty = $prefix:literal),* $(,)?) => {
+                $(self.$($field).+.bind_config($prefix, values, &mut errors, &mut unmatched);)*
+            };
+        }
+        config_sections!(bind_sections);
         errors.extend(unmatched.into_iter().map(|key| format!("unknown configuration property {}", crate::errors::sanitize(key))));
         if errors.is_empty() {
             Ok(())
@@ -395,44 +404,24 @@ impl AppConfig {
     fn from_env_unvalidated(env: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
         let mut config = Self::default();
         let mut errors = Vec::new();
-        config.postgres.bind(env, &mut errors);
-        config.kafka.bind(env, &mut errors);
-        config.cron.bind(env, &mut errors);
-        config.ingest.bind(env, &mut errors);
-        config.backpressure.bind(env, &mut errors);
-        config.http.bind(env, &mut errors);
-        config.public_stats.bind(env, &mut errors);
-        config.sync.bind(env, &mut errors);
-        config.wireless.bind(env, &mut errors);
-        config.wireless.projection.bind(env, &mut errors);
-        config.runtime.bind(env, &mut errors);
-        config.processors.bind(env, &mut errors);
-        config.archive.bind(env, &mut errors);
-        config.dq.bind(env, &mut errors);
+        macro_rules! bind_sections {
+            ($($($field:ident).+: $ty:ty = $prefix:literal),* $(,)?) => {
+                $(config.$($field).+.bind(env, &mut errors);)*
+            };
+        }
+        config_sections!(bind_sections);
         if !errors.is_empty() {
             return Err(ConfigError(errors));
         }
         Ok(config)
     }
     pub fn environment_keys() -> Vec<&'static str> {
-        [
-            PostgresConfig::ENVIRONMENT_KEYS,
-            KafkaCfg::ENVIRONMENT_KEYS,
-            CronConfig::ENVIRONMENT_KEYS,
-            IngestConfig::ENVIRONMENT_KEYS,
-            BackpressureConfig::ENVIRONMENT_KEYS,
-            HttpConfig::ENVIRONMENT_KEYS,
-            PublicStatsConfig::ENVIRONMENT_KEYS,
-            SyncConfig::ENVIRONMENT_KEYS,
-            WirelessConfig::ENVIRONMENT_KEYS,
-            WirelessProjectionConfig::ENVIRONMENT_KEYS,
-            RuntimeConfig::ENVIRONMENT_KEYS,
-            ProcessorConfig::ENVIRONMENT_KEYS,
-            ArchiveConfig::ENVIRONMENT_KEYS,
-            DqConfig::ENVIRONMENT_KEYS,
-            &["POSTGRES_PASSWORD_FILE"],
-        ]
-        .concat()
+        macro_rules! collect_keys {
+            ($($($field:ident).+: $ty:ty = $prefix:literal),* $(,)?) => {
+                [$(<$ty>::ENVIRONMENT_KEYS,)* &["POSTGRES_PASSWORD_FILE"]].concat()
+            };
+        }
+        config_sections!(collect_keys)
     }
     pub fn resolve_postgres_password<F>(
         &mut self,
@@ -473,117 +462,19 @@ impl AppConfig {
                 errors.push(message.to_owned());
             }
         };
+        self.processors.validate(&mut check);
         let p = &self.processors;
-        check(
-            p.enabled.iter().any(|s| trim(s).is_empty()),
-            "processors.enabled must not contain blank processor IDs",
-        );
-        check(
-            duplicates(&p.enabled),
-            "processors.enabled must not contain duplicate processor IDs",
-        );
-        check(
-            p.restart_base_delay_ms <= 0,
-            "processors.restart-base-delay-ms must be positive",
-        );
-        check(
-            p.restart_max_delay_ms < p.restart_base_delay_ms,
-            "processors.restart-max-delay-ms must be at least processors.restart-base-delay-ms",
-        );
-        check(p.batch_size <= 0, "processors.batch-size must be positive");
-        check(
-            p.interval_seconds <= 0,
-            "processors.interval-seconds must be positive",
-        );
-        check(
-            p.embedding_model != "nomic-embed-text-v2-moe",
-            "processors.embedding-model must be nomic-embed-text-v2-moe",
-        );
-        check(
-            p.embedding_pending_high_water < 0,
-            "processors.embedding-pending-high-water must not be negative",
-        );
-        check(
-            p.enabled.iter().any(|s| s == "proxy-search-preparer")
-                && p.embedding_pending_high_water <= 0,
-            "proxy-search-preparer requires a positive embedding-pending-high-water",
-        );
-        check(p.proxy_input_revision!="legacy_unknown" && !p.proxy_input_revision.strip_prefix("nomic-prefix-v1:").is_some_and(sha256),"processors.proxy-input-revision must be legacy_unknown or nomic-prefix-v1:<artifact-sha256>");
-        check(
-            !p.event_duplicate_distance.is_finite()
-                || !(0.0..=2.0).contains(&p.event_duplicate_distance),
-            "processors.event-duplicate-distance must be between 0 and 2",
-        );
-        check(
-            !p.behavior_similarity_threshold.is_finite()
-                || !(-1.0..=1.0).contains(&p.behavior_similarity_threshold),
-            "processors.behavior-similarity-threshold must be between -1 and 1",
-        );
-        check(
-            !p.sequence_distance_threshold.is_finite()
-                || !(0.0..=2.0).contains(&p.sequence_distance_threshold),
-            "processors.sequence-distance-threshold must be between 0 and 2",
-        );
         check(
             !p.enabled.is_empty() && !self.runtime.processors_enabled,
             "processors.enabled requires runtime.processors-enabled=true",
         );
-        let ingest = &self.ingest;
-        check(
-            !ingest.stream_names.iter().any(|s| s == "proxy.events"),
-            "ingest.stream-names must contain proxy.events",
-        );
-        check(!ingest.load_stream_names.iter().any(|s|s=="proxy.events"),"ingest.load-stream-names must contain proxy.events so proxy events are persisted to PostgreSQL");
-        check(
-            duplicates(&ingest.stream_names),
-            "ingest.stream-names must not contain duplicates",
-        );
-        check(
-            duplicates(&ingest.load_stream_names),
-            "ingest.load-stream-names must not contain duplicates",
-        );
-        check(
-            ingest
-                .load_stream_names
-                .iter()
-                .any(|s| !ingest.stream_names.contains(s)),
-            "ingest.load-stream-names must be a subset of ingest.stream-names",
-        );
+        self.ingest.validate(&mut check);
         let a = &self.archive;
         check(
             p.enabled.iter().any(|s| s == "event-retention") && !a.enabled,
             "event-retention requires archive.enabled=true",
         );
-        for (field, value) in [
-            ("endpoint", &a.endpoint),
-            ("access-key", &a.access_key),
-            ("secret-key", &a.secret_key),
-            ("bucket", &a.bucket),
-        ] {
-            check(
-                a.enabled && trim(value).is_empty(),
-                &format!("archive.{field} must not be blank"),
-            );
-        }
-        check(a.hot_days <= 0, "archive.hot-days must be positive");
-        check(
-            a.event_retention_days < a.hot_days,
-            "archive.event-retention-days must be at least archive.hot-days",
-        );
-        check(
-            a.search_retention_days <= 0,
-            "archive.search-retention-days must be positive",
-        );
-        check(
-            a.tombstone_retention_days < a.event_retention_days,
-            "archive.tombstone-retention-days must be at least archive.event-retention-days",
-        );
-        check(a.batch_size <= 0, "archive.batch-size must be positive");
-        check(a.interval_ms <= 0, "archive.interval-ms must be positive");
-        check(
-            a.maintenance_interval_ms <= 0,
-            "archive.maintenance-interval-ms must be positive",
-        );
+        self.archive.validate(&mut check);
         check(
             self.dq.enabled
                 && [&a.endpoint, &a.access_key, &a.secret_key]
@@ -591,199 +482,19 @@ impl AppConfig {
                     .any(|s| trim(s).is_empty()),
             "enabled DQ requires MINIO_ENDPOINT, MINIO_ACCESS_KEY_ID and MINIO_SECRET_ACCESS_KEY",
         );
+        self.kafka.validate(&mut check);
         let k = &self.kafka;
-        check(k.load_topic != "sync.oracle.load", "kafka.load-topic must be sync.oracle.load");
-        check(k.result_topic != "sync.oracle.result", "kafka.result-topic must be sync.oracle.result");
-        check(
-            k.dlq_suffix.is_empty(),
-            "kafka.dlq-suffix must not be empty",
-        );
-        for (field, value) in [
-            ("max-poll-records", i64::from(k.max_poll_records)),
-            ("scan-consumers-count", i64::from(k.scan_consumers_count)),
-            ("load-consumers-count", i64::from(k.load_consumers_count)),
-            (
-                "result-consumers-count",
-                i64::from(k.result_consumers_count),
-            ),
-            ("poll-timeout-ms", k.poll_timeout_ms),
-            ("topic-partitions", i64::from(k.topic_partitions)),
-            ("locked-batch-size", i64::from(k.locked_batch_size)),
-            ("locked-batch-window-ms", k.locked_batch_window_ms),
-            (
-                "locked-batch-max-bytes",
-                i64::from(k.locked_batch_max_bytes),
-            ),
-        ] {
-            check(value <= 0, &format!("kafka.{field} must be positive"));
-        }
-        check(
-            k.locked_batch_size > k.max_poll_records,
-            "kafka.locked-batch-size must not exceed kafka.max-poll-records",
-        );
-        check(
-            !(1..=32767).contains(&k.topic_replication_factor),
-            "kafka.topic-replication-factor must be between 1 and 32767",
-        );
         check(
             !(1..=65535).contains(&self.http.port),
             "http.port must be between 1 and 65535",
         );
-        check(
-            self.public_stats.enabled && self.public_stats.allowed_origins.is_empty(),
-            "public-stats.allowed-origins must not be empty when public-stats.enabled=true",
-        );
-        check(
-            self.public_stats.allowed_origins.iter().any(|origin| origin.trim().is_empty()),
-            "public-stats.allowed-origins must not contain blank entries",
-        );
-        check(
-            self.public_stats.peaks_refresh_seconds <= 0,
-            "public-stats.peaks-refresh-seconds must be positive",
-        );
-        check(
-            self.public_stats.rate_window_seconds <= 0,
-            "public-stats.rate-window-seconds must be positive",
-        );
-        check(
-            self.wireless.consumers_count <= 0,
-            "wireless.consumers-count must be positive",
-        );
-        check(
-            self.wireless.max_poll_records <= 0,
-            "wireless.max-poll-records must be positive",
-        );
-        let b = &self.backpressure;
-        for (field, value) in [
-            ("budget-multiplier", b.budget_multiplier),
-            (
-                "adaptive-pull-change-threshold",
-                b.adaptive_pull_change_threshold,
-            ),
-            (
-                "adaptive-pull-min-restart-interval-ms",
-                b.adaptive_pull_min_restart_interval_ms,
-            ),
-        ] {
-            check(
-                value <= 0,
-                &format!("backpressure.{field} must be positive"),
-            );
-        }
-        let c = &self.cron;
-        for (field, value) in [
-            ("idle-sleep-ms", c.idle_sleep_ms),
-            ("idle-sleep-backoff-ms", c.idle_sleep_backoff_ms),
-            ("dispatch-batch-size", c.dispatch_batch_size),
-            ("ingest-batch-size", c.ingest_batch_size),
-            ("scan-max-attempts", c.scan_max_attempts),
-            ("scan-retry-backoff-seconds", c.scan_retry_backoff_seconds),
-            (
-                "batch-dispatch-lease-seconds",
-                c.batch_dispatch_lease_seconds,
-            ),
-            (
-                "batch-dispatch-retry-max-seconds",
-                c.batch_dispatch_retry_max_seconds,
-            ),
-            ("batch-max-attempts", c.batch_max_attempts),
-            ("heartbeat-log-interval-ms", c.heartbeat_log_interval_ms),
-            (
-                "schema-refresh-interval-seconds",
-                c.schema_refresh_interval_seconds,
-            ),
-            ("scan-fetch-count", c.scan_fetch_count),
-            ("result-fetch-count", c.result_fetch_count),
-        ] {
-            check(value <= 0, &format!("cron.{field} must be positive"));
-        }
-        check(c.batch_dispatch_retry_max_seconds<c.scan_retry_backoff_seconds,"cron.batch-dispatch-retry-max-seconds must be at least cron.scan-retry-backoff-seconds");
+        self.public_stats.validate(&mut check);
+        self.wireless.validate(&mut check);
+        self.backpressure.validate(&mut check);
+        self.cron.validate(&mut check);
+        self.postgres
+            .validate(&mut check, &self.runtime.environment);
         let pg = &self.postgres;
-        check(
-            !(1..=65535).contains(&pg.port),
-            "postgres.port must be between 1 and 65535",
-        );
-        check(pg.pool_size <= 0, "postgres.pool-size must be positive");
-        check(
-            pg.healthcheck_reserve < 0,
-            "postgres.healthcheck-reserve must not be negative",
-        );
-        check(
-            pg.healthcheck_reserve >= pg.pool_size,
-            "postgres.healthcheck-reserve must be smaller than postgres.pool-size",
-        );
-        check(
-            pg.connection_timeout_ms <= 0,
-            "postgres.connection-timeout-ms must be positive",
-        );
-        check(!(1..=i32::MAX/1000).contains(&pg.statement_timeout_secs),"postgres.statement-timeout-secs must be positive and safely convertible to milliseconds");
-        check(
-            !(1..=i32::MAX / 1000).contains(&pg.network_timeout_secs),
-            "postgres.network-timeout-secs must be positive and safely convertible to milliseconds",
-        );
-        check(
-            pg.network_timeout_secs <= pg.statement_timeout_secs,
-            "postgres.network-timeout-secs must exceed postgres.statement-timeout-secs",
-        );
-        check(
-            pg.load_chunk_max_bytes <= 0,
-            "postgres.load-chunk-max-bytes must be positive",
-        );
-        if pg.enabled {
-            for (field, value) in [
-                ("host", &pg.host),
-                ("database", &pg.database),
-                ("user", &pg.user),
-                ("password", &pg.password),
-            ] {
-                check(
-                    trim(value).is_empty(),
-                    &format!("postgres.{field} must not be blank"),
-                );
-            }
-            check(
-                ["localhost", "127.0.0.1", "::1", "[::1]"]
-                    .contains(&trim(&pg.host).to_ascii_lowercase().as_str()),
-                "postgres.host must reference the external PostgreSQL cluster, not loopback",
-            );
-            check(
-                ["root", "postgres"].contains(&trim(&pg.user).to_ascii_lowercase().as_str()),
-                "postgres.user must be a least-privilege non-superuser account",
-            );
-            check(
-                trim(&pg.database) != "sync",
-                "postgres.database must select sync",
-            );
-            if pg.ssl_mode != "disable" {
-                check(
-                    trim(&pg.ssl_ca_path).is_empty(),
-                    "postgres.ssl-ca-path is required when ssl-mode is not disable",
-                );
-                check(
-                    trim(&pg.ssl_server_name).is_empty(),
-                    "postgres.ssl-server-name is required when ssl-mode is not disable",
-                );
-                check(!trim(&pg.ssl_server_name).is_empty() && !trim(&pg.ssl_server_name).eq_ignore_ascii_case(trim(&pg.host)),"postgres.ssl-server-name must equal postgres.host because the PostgreSQL driver verifies the endpoint identity");
-                check(trim(&pg.ssl_client_key_store_path).is_empty()!=trim(&pg.ssl_client_key_store_password).is_empty(),"postgres.ssl-client-key-store-path and postgres.ssl-client-key-store-password must be configured together");
-                check(
-                    !["JKS", "PKCS12"].contains(
-                        &trim(&pg.ssl_client_key_store_type)
-                            .to_ascii_uppercase()
-                            .as_str(),
-                    ),
-                    "postgres.ssl-client-key-store-type must be JKS or PKCS12",
-                );
-            }
-            check(
-                pg.warn_only,
-                "postgres.warn-only must be false when PostgreSQL readiness is enabled",
-            );
-            check(pg.local_dev_allow_public_key_retrieval && self.runtime.environment!="development","postgres.local-dev-allow-public-key-retrieval requires OCTOPUS_ENVIRONMENT=development");
-            check(
-                !sha256(&pg.manifest_sha256),
-                "postgres.manifest-sha-256 must be 64 lowercase hexadecimal characters",
-            );
-        }
         if self.runtime.any_enabled() || !p.enabled.is_empty() || self.dq.enabled {
             check(
                 !pg.enabled,
@@ -859,6 +570,376 @@ impl AppConfig {
             Ok(())
         } else {
             Err(ConfigError(errors))
+        }
+    }
+}
+
+impl ProcessorConfig {
+    fn validate(&self, check: &mut impl FnMut(bool, &str)) {
+        check(
+            self.enabled.iter().any(|s| trim(s).is_empty()),
+            "processors.enabled must not contain blank processor IDs",
+        );
+        check(
+            duplicates(&self.enabled),
+            "processors.enabled must not contain duplicate processor IDs",
+        );
+        check(
+            self.restart_base_delay_ms <= 0,
+            "processors.restart-base-delay-ms must be positive",
+        );
+        check(
+            self.restart_max_delay_ms < self.restart_base_delay_ms,
+            "processors.restart-max-delay-ms must be at least processors.restart-base-delay-ms",
+        );
+        check(
+            self.batch_size <= 0,
+            "processors.batch-size must be positive",
+        );
+        check(
+            self.interval_seconds <= 0,
+            "processors.interval-seconds must be positive",
+        );
+        check(
+            self.embedding_model != "nomic-embed-text-v2-moe",
+            "processors.embedding-model must be nomic-embed-text-v2-moe",
+        );
+        check(
+            self.embedding_pending_high_water < 0,
+            "processors.embedding-pending-high-water must not be negative",
+        );
+        check(
+            self.enabled.iter().any(|s| s == "proxy-search-preparer")
+                && self.embedding_pending_high_water <= 0,
+            "proxy-search-preparer requires a positive embedding-pending-high-water",
+        );
+        check(
+            self.proxy_input_revision != "legacy_unknown"
+                && !self.proxy_input_revision.strip_prefix("nomic-prefix-v1:").is_some_and(sha256),
+            "processors.proxy-input-revision must be legacy_unknown or nomic-prefix-v1:<artifact-sha256>",
+        );
+        check(
+            !self.event_duplicate_distance.is_finite()
+                || !(0.0..=2.0).contains(&self.event_duplicate_distance),
+            "processors.event-duplicate-distance must be between 0 and 2",
+        );
+        check(
+            !self.behavior_similarity_threshold.is_finite()
+                || !(-1.0..=1.0).contains(&self.behavior_similarity_threshold),
+            "processors.behavior-similarity-threshold must be between -1 and 1",
+        );
+        check(
+            !self.sequence_distance_threshold.is_finite()
+                || !(0.0..=2.0).contains(&self.sequence_distance_threshold),
+            "processors.sequence-distance-threshold must be between 0 and 2",
+        );
+    }
+}
+
+impl IngestConfig {
+    fn validate(&self, check: &mut impl FnMut(bool, &str)) {
+        check(
+            !self.stream_names.iter().any(|s| s == "proxy.events"),
+            "ingest.stream-names must contain proxy.events",
+        );
+        check(
+            !self.load_stream_names.iter().any(|s| s == "proxy.events"),
+            "ingest.load-stream-names must contain proxy.events so proxy events are persisted to PostgreSQL",
+        );
+        check(
+            duplicates(&self.stream_names),
+            "ingest.stream-names must not contain duplicates",
+        );
+        check(
+            duplicates(&self.load_stream_names),
+            "ingest.load-stream-names must not contain duplicates",
+        );
+        check(
+            self.load_stream_names
+                .iter()
+                .any(|s| !self.stream_names.contains(s)),
+            "ingest.load-stream-names must be a subset of ingest.stream-names",
+        );
+    }
+}
+
+impl ArchiveConfig {
+    fn validate(&self, check: &mut impl FnMut(bool, &str)) {
+        for (field, value) in [
+            ("endpoint", &self.endpoint),
+            ("access-key", &self.access_key),
+            ("secret-key", &self.secret_key),
+            ("bucket", &self.bucket),
+        ] {
+            check(
+                self.enabled && trim(value).is_empty(),
+                &format!("archive.{field} must not be blank"),
+            );
+        }
+        check(self.hot_days <= 0, "archive.hot-days must be positive");
+        check(
+            self.event_retention_days < self.hot_days,
+            "archive.event-retention-days must be at least archive.hot-days",
+        );
+        check(
+            self.search_retention_days <= 0,
+            "archive.search-retention-days must be positive",
+        );
+        check(
+            self.tombstone_retention_days < self.event_retention_days,
+            "archive.tombstone-retention-days must be at least archive.event-retention-days",
+        );
+        check(self.batch_size <= 0, "archive.batch-size must be positive");
+        check(
+            self.interval_ms <= 0,
+            "archive.interval-ms must be positive",
+        );
+        check(
+            self.maintenance_interval_ms <= 0,
+            "archive.maintenance-interval-ms must be positive",
+        );
+    }
+}
+
+impl KafkaCfg {
+    fn validate(&self, check: &mut impl FnMut(bool, &str)) {
+        check(
+            self.load_topic != "sync.oracle.load",
+            "kafka.load-topic must be sync.oracle.load",
+        );
+        check(
+            self.result_topic != "sync.oracle.result",
+            "kafka.result-topic must be sync.oracle.result",
+        );
+        check(
+            self.dlq_suffix.is_empty(),
+            "kafka.dlq-suffix must not be empty",
+        );
+        for (field, value) in [
+            ("max-poll-records", i64::from(self.max_poll_records)),
+            ("scan-consumers-count", i64::from(self.scan_consumers_count)),
+            ("load-consumers-count", i64::from(self.load_consumers_count)),
+            (
+                "result-consumers-count",
+                i64::from(self.result_consumers_count),
+            ),
+            ("poll-timeout-ms", self.poll_timeout_ms),
+            ("topic-partitions", i64::from(self.topic_partitions)),
+            ("locked-batch-size", i64::from(self.locked_batch_size)),
+            ("locked-batch-window-ms", self.locked_batch_window_ms),
+            (
+                "locked-batch-max-bytes",
+                i64::from(self.locked_batch_max_bytes),
+            ),
+        ] {
+            check(value <= 0, &format!("kafka.{field} must be positive"));
+        }
+        check(
+            self.locked_batch_size > self.max_poll_records,
+            "kafka.locked-batch-size must not exceed kafka.max-poll-records",
+        );
+        check(
+            !(1..=32767).contains(&self.topic_replication_factor),
+            "kafka.topic-replication-factor must be between 1 and 32767",
+        );
+    }
+}
+
+impl PublicStatsConfig {
+    fn validate(&self, check: &mut impl FnMut(bool, &str)) {
+        check(
+            self.enabled && self.allowed_origins.is_empty(),
+            "public-stats.allowed-origins must not be empty when public-stats.enabled=true",
+        );
+        check(
+            self.allowed_origins
+                .iter()
+                .any(|origin| origin.trim().is_empty()),
+            "public-stats.allowed-origins must not contain blank entries",
+        );
+        check(
+            self.peaks_refresh_seconds <= 0,
+            "public-stats.peaks-refresh-seconds must be positive",
+        );
+        check(
+            self.rate_window_seconds <= 0,
+            "public-stats.rate-window-seconds must be positive",
+        );
+    }
+}
+
+impl WirelessConfig {
+    fn validate(&self, check: &mut impl FnMut(bool, &str)) {
+        check(
+            self.consumers_count <= 0,
+            "wireless.consumers-count must be positive",
+        );
+        check(
+            self.max_poll_records <= 0,
+            "wireless.max-poll-records must be positive",
+        );
+    }
+}
+
+impl BackpressureConfig {
+    fn validate(&self, check: &mut impl FnMut(bool, &str)) {
+        for (field, value) in [
+            ("budget-multiplier", self.budget_multiplier),
+            (
+                "adaptive-pull-change-threshold",
+                self.adaptive_pull_change_threshold,
+            ),
+            (
+                "adaptive-pull-min-restart-interval-ms",
+                self.adaptive_pull_min_restart_interval_ms,
+            ),
+        ] {
+            check(
+                value <= 0,
+                &format!("backpressure.{field} must be positive"),
+            );
+        }
+    }
+}
+
+impl CronConfig {
+    fn validate(&self, check: &mut impl FnMut(bool, &str)) {
+        for (field, value) in [
+            ("idle-sleep-ms", self.idle_sleep_ms),
+            ("idle-sleep-backoff-ms", self.idle_sleep_backoff_ms),
+            ("dispatch-batch-size", self.dispatch_batch_size),
+            ("ingest-batch-size", self.ingest_batch_size),
+            ("scan-max-attempts", self.scan_max_attempts),
+            (
+                "scan-retry-backoff-seconds",
+                self.scan_retry_backoff_seconds,
+            ),
+            (
+                "batch-dispatch-lease-seconds",
+                self.batch_dispatch_lease_seconds,
+            ),
+            (
+                "batch-dispatch-retry-max-seconds",
+                self.batch_dispatch_retry_max_seconds,
+            ),
+            ("batch-max-attempts", self.batch_max_attempts),
+            ("heartbeat-log-interval-ms", self.heartbeat_log_interval_ms),
+            (
+                "schema-refresh-interval-seconds",
+                self.schema_refresh_interval_seconds,
+            ),
+            ("scan-fetch-count", self.scan_fetch_count),
+            ("result-fetch-count", self.result_fetch_count),
+        ] {
+            check(value <= 0, &format!("cron.{field} must be positive"));
+        }
+        check(
+            self.batch_dispatch_retry_max_seconds < self.scan_retry_backoff_seconds,
+            "cron.batch-dispatch-retry-max-seconds must be at least cron.scan-retry-backoff-seconds",
+        );
+    }
+}
+
+impl PostgresConfig {
+    fn validate(&self, check: &mut impl FnMut(bool, &str), environment: &str) {
+        check(
+            !(1..=65535).contains(&self.port),
+            "postgres.port must be between 1 and 65535",
+        );
+        check(self.pool_size <= 0, "postgres.pool-size must be positive");
+        check(
+            self.healthcheck_reserve < 0,
+            "postgres.healthcheck-reserve must not be negative",
+        );
+        check(
+            self.healthcheck_reserve >= self.pool_size,
+            "postgres.healthcheck-reserve must be smaller than postgres.pool-size",
+        );
+        check(
+            self.connection_timeout_ms <= 0,
+            "postgres.connection-timeout-ms must be positive",
+        );
+        check(
+            !(1..=i32::MAX / 1000).contains(&self.statement_timeout_secs),
+            "postgres.statement-timeout-secs must be positive and safely convertible to milliseconds",
+        );
+        check(
+            !(1..=i32::MAX / 1000).contains(&self.network_timeout_secs),
+            "postgres.network-timeout-secs must be positive and safely convertible to milliseconds",
+        );
+        check(
+            self.network_timeout_secs <= self.statement_timeout_secs,
+            "postgres.network-timeout-secs must exceed postgres.statement-timeout-secs",
+        );
+        check(
+            self.load_chunk_max_bytes <= 0,
+            "postgres.load-chunk-max-bytes must be positive",
+        );
+        if self.enabled {
+            for (field, value) in [
+                ("host", &self.host),
+                ("database", &self.database),
+                ("user", &self.user),
+                ("password", &self.password),
+            ] {
+                check(
+                    trim(value).is_empty(),
+                    &format!("postgres.{field} must not be blank"),
+                );
+            }
+            check(
+                ["localhost", "127.0.0.1", "::1", "[::1]"]
+                    .contains(&trim(&self.host).to_ascii_lowercase().as_str()),
+                "postgres.host must reference the external PostgreSQL cluster, not loopback",
+            );
+            check(
+                ["root", "postgres"].contains(&trim(&self.user).to_ascii_lowercase().as_str()),
+                "postgres.user must be a least-privilege non-superuser account",
+            );
+            check(
+                trim(&self.database) != "sync",
+                "postgres.database must select sync",
+            );
+            if self.ssl_mode != "disable" {
+                check(
+                    trim(&self.ssl_ca_path).is_empty(),
+                    "postgres.ssl-ca-path is required when ssl-mode is not disable",
+                );
+                check(
+                    trim(&self.ssl_server_name).is_empty(),
+                    "postgres.ssl-server-name is required when ssl-mode is not disable",
+                );
+                check(
+                    !trim(&self.ssl_server_name).is_empty()
+                        && !trim(&self.ssl_server_name).eq_ignore_ascii_case(trim(&self.host)),
+                    "postgres.ssl-server-name must equal postgres.host because the PostgreSQL driver verifies the endpoint identity",
+                );
+                check(
+                    trim(&self.ssl_client_key_store_path).is_empty()
+                        != trim(&self.ssl_client_key_store_password).is_empty(),
+                    "postgres.ssl-client-key-store-path and postgres.ssl-client-key-store-password must be configured together",
+                );
+                check(
+                    !["JKS", "PKCS12"].contains(
+                        &trim(&self.ssl_client_key_store_type)
+                            .to_ascii_uppercase()
+                            .as_str(),
+                    ),
+                    "postgres.ssl-client-key-store-type must be JKS or PKCS12",
+                );
+            }
+            check(
+                self.warn_only,
+                "postgres.warn-only must be false when PostgreSQL readiness is enabled",
+            );
+            check(
+                self.local_dev_allow_public_key_retrieval && environment != "development",
+                "postgres.local-dev-allow-public-key-retrieval requires OCTOPUS_ENVIRONMENT=development",
+            );
+            check(
+                !sha256(&self.manifest_sha256),
+                "postgres.manifest-sha-256 must be 64 lowercase hexadecimal characters",
+            );
         }
     }
 }

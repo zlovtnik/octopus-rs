@@ -7,10 +7,13 @@ use crate::{
     domain::{
         BrokerRecordMetadata, IngestionDecision, IngestionDisposition, ResolvedScanRequestRecord,
     },
-    postgres::{PgError, PgRuntime, PgTransaction, PostgresErrorClass},
+    postgres::{
+        retry_broker_transaction, BrokerEvidenceError, PgError, PgRuntime, PgTransaction,
+        PostgresErrorClass,
+    },
     util::{java_is_blank, java_trim, stable_uuid, utf16_length},
 };
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc};
 
 #[path = "ingestion/wireless.rs"]
 mod wireless;
@@ -23,6 +26,18 @@ pub enum IntakeError {
     Invariant(&'static str),
     #[error(transparent)]
     Database(#[from] PgError),
+}
+
+impl From<BrokerEvidenceError> for IntakeError {
+    fn from(error: BrokerEvidenceError) -> Self {
+        match error {
+            BrokerEvidenceError::Database(error) => Self::Database(error),
+            BrokerEvidenceError::Conflict => {
+                Self::Invariant("broker coordinate changed after ingestion")
+            }
+            BrokerEvidenceError::Missing => Self::Invariant("evidence disappeared after upsert"),
+        }
+    }
 }
 
 impl IntakeError {
@@ -119,24 +134,11 @@ impl IngestionStore {
         &self,
         records: &[(&ResolvedScanRequestRecord, Option<&BrokerRecordMetadata>)],
     ) -> Result<Vec<IngestionDecision>, IntakeError> {
-        for attempt in 0..5 {
-            let result = self.record_batch_once(records).await;
-            if result.as_ref().err().is_some_and(IntakeError::is_retryable) && attempt < 4 {
-                // Match the existing 25ms exponential retry base and bounded
-                // jitter; identities never depend on retry timing.
-                let base = 25 << attempt;
-                let random = uuid::Uuid::new_v4();
-                let jitter = u64::from_le_bytes(
-                    random.as_bytes()[..8]
-                        .try_into()
-                        .expect("UUID has sixteen bytes"),
-                ) % base;
-                tokio::time::sleep(Duration::from_millis(base + jitter)).await;
-            } else {
-                return result;
-            }
-        }
-        unreachable!("bounded loop always returns its fifth result")
+        retry_broker_transaction(
+            || self.record_batch_once(records),
+            IntakeError::is_retryable,
+        )
+        .await
     }
 
     async fn record_batch_once(
@@ -208,30 +210,6 @@ fn validate(
     Ok(())
 }
 
-async fn evidence(
-    tx: &mut PgTransaction,
-    m: &BrokerRecordMetadata,
-) -> Result<Option<(String, String)>, IntakeError> {
-    let rows = tx.query("SELECT payload_sha256, dedupe_key FROM ingestion_evidence WHERE topic=$1 AND partition_id=$2 AND record_offset=$3 AND group_id=$4",
-        &[&m.topic, &m.partition, &m.offset, &m.consumer_group]).await?;
-    Ok(rows.first().map(|row| (row.get(0), row.get(1))))
-}
-
-fn verify_evidence(
-    record: &ResolvedScanRequestRecord,
-    existing: &(String, String),
-) -> Result<(), IntakeError> {
-    if existing.0 != record.source().source_record_sha256()
-        || existing.1 != record.source().dedupe_key()
-    {
-        Err(IntakeError::Invariant(
-            "broker coordinate changed after ingestion",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 async fn ingest(
     tx: &mut PgTransaction,
     record: &ResolvedScanRequestRecord,
@@ -250,9 +228,25 @@ async fn ingest(
         .as_deref()
         .filter(|kind| utf16_length(kind) <= 64);
     if let Some(m) = metadata {
-        if let Some(existing) = evidence(tx, m).await? {
-            verify_evidence(record, &existing)?;
-            hydrate(tx, record, event_kind).await?;
+        if tx.check_broker_evidence(m, key).await? {
+            let hydrated = hydrate(tx, record, event_kind).await?;
+            if create_batch && hydrated {
+                // A replay can admit work for a newly enabled stream. Hydration
+                // has locked the live event and checked its business payload.
+                let waiting_for_admission = !tx
+                    .query(
+                        "SELECT 1 FROM sync_events e
+                         WHERE e.stream_name=$1 AND e.dedupe_key=$2 AND e.status='completed'
+                           AND NOT EXISTS (SELECT 1 FROM sync_jobs j
+                             WHERE j.stream_name=e.stream_name AND j.dedupe_key=e.dedupe_key)",
+                        &[&stream, &key],
+                    )
+                    .await?
+                    .is_empty();
+                if waiting_for_admission {
+                    ensure_batch(tx, record, &job_id, &batch_id).await?;
+                }
+            }
             return persisted_decision(
                 tx,
                 stream,
@@ -297,43 +291,7 @@ async fn ingest(
             upsert_heartbeat(tx, record).await?;
         }
         if create_batch {
-            tx.execute("INSERT INTO sync_jobs(job_id,stream_name,dedupe_key,status,attempt_count,created_at) VALUES ($1,$2,$3,'pending',0,CURRENT_TIMESTAMP) ON CONFLICT(dedupe_key,stream_name) DO UPDATE SET job_id=sync_jobs.job_id", &[&job_id,&stream,&key]).await?;
-            let persisted_job: String = tx
-                .query(
-                    "SELECT job_id FROM sync_jobs WHERE stream_name=$1 AND dedupe_key=$2",
-                    &[&stream, &key],
-                )
-                .await?[0]
-                .get(0);
-            let cursors = tx
-                .query(
-                    "SELECT cursor_value FROM sync_cursors WHERE stream_name=$1",
-                    &[&stream],
-                )
-                .await?;
-            let cursor: String = cursors
-                .first()
-                .map(|row| row.get(0))
-                .unwrap_or_else(|| "0".into());
-            let cursor_end = if stream == "wireless.audit" {
-                tx.query(
-                    "SELECT floor(extract(epoch FROM CAST($1 AS text)::timestamptz))::text",
-                    &[&source.observed_at()],
-                )
-                .await?[0]
-                    .get::<_, String>(0)
-            } else {
-                key.into()
-            };
-            tx.execute("WITH new_batch AS (
-                INSERT INTO sync_batches(batch_id,job_id,batch_no,payload_ref,status,row_count,attempt_count,dedupe_key,stream_name,cursor_start,cursor_end,created_at,updated_at)
-                VALUES ($1,$2,0,$3,'pending',1,0,$4,$5,$6,$7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
-                ON CONFLICT(dedupe_key,stream_name) DO NOTHING
-                RETURNING 1
-            )
-            UPDATE sync_events SET status='batched',updated_at=CURRENT_TIMESTAMP
-            WHERE dedupe_key=$4 AND stream_name=$5 AND status<>'batched' AND EXISTS (SELECT 1 FROM new_batch)",
-                &[&batch_id,&persisted_job,&source.payload_ref(),&key,&stream,&cursor,&cursor_end]).await?;
+            ensure_batch(tx, record, &job_id, &batch_id).await?;
         }
         let disposition = if existed {
             IngestionDisposition::Deduplicated
@@ -343,21 +301,59 @@ async fn ingest(
         persisted_decision(tx, stream, key, job_id, batch_id, disposition).await?
     };
     if let Some(m) = metadata {
-        // Legacy columns retain textual consumer versions even though the
-        // consumer contract validates them as positive i32 values.
-        let group_version = m.group_version.to_string();
-        tx.execute("INSERT INTO ingestion_evidence(topic,partition_id,record_offset,group_id,group_version,artifact_sha256,message_key,payload_sha256,disposition,dedupe_key,first_seen_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT ON CONSTRAINT ingestion_evidence_pkey DO UPDATE SET updated_at=CURRENT_TIMESTAMP",
-            &[&m.topic,&m.partition,&m.offset,&m.consumer_group,&group_version,&m.artifact_sha256,&m.message_key,&source.source_record_sha256(),&decision.disposition.database_value(),&key]).await?;
-        let stored = evidence(tx, m)
-            .await?
-            .ok_or(IntakeError::Invariant("evidence disappeared after upsert"))?;
-        verify_evidence(record, &stored)?;
-        // This is diagnostic evidence, never the source of broker restart offsets.
-        let next_offset = m.offset.wrapping_add(1);
-        tx.execute("INSERT INTO consumer_offsets(group_id,topic,partition_id,next_offset,group_version,artifact_sha256,updated_at) VALUES ($1,$2,$3,$4,$5,$6,CURRENT_TIMESTAMP) ON CONFLICT(group_id,topic,partition_id) DO UPDATE SET group_version=CASE WHEN EXCLUDED.next_offset>consumer_offsets.next_offset THEN EXCLUDED.group_version ELSE consumer_offsets.group_version END, artifact_sha256=CASE WHEN EXCLUDED.next_offset>consumer_offsets.next_offset THEN EXCLUDED.artifact_sha256 ELSE consumer_offsets.artifact_sha256 END,next_offset=GREATEST(consumer_offsets.next_offset,EXCLUDED.next_offset),updated_at=CURRENT_TIMESTAMP",
-            &[&m.consumer_group,&m.topic,&m.partition,&next_offset,&group_version,&m.artifact_sha256]).await?;
+        tx.record_broker_evidence(m, key, decision.disposition)
+            .await?;
     }
     Ok(decision)
+}
+
+async fn ensure_batch(
+    tx: &mut PgTransaction,
+    record: &ResolvedScanRequestRecord,
+    job_id: &str,
+    batch_id: &str,
+) -> Result<(), IntakeError> {
+    let source = record.source();
+    let stream = source.stream_name();
+    let key = source.dedupe_key();
+    tx.execute("INSERT INTO sync_jobs(job_id,stream_name,dedupe_key,status,attempt_count,created_at) VALUES ($1,$2,$3,'pending',0,CURRENT_TIMESTAMP) ON CONFLICT(dedupe_key,stream_name) DO UPDATE SET job_id=sync_jobs.job_id", &[&job_id,&stream,&key]).await?;
+    let persisted_job: String = tx
+        .query(
+            "SELECT job_id FROM sync_jobs WHERE stream_name=$1 AND dedupe_key=$2",
+            &[&stream, &key],
+        )
+        .await?[0]
+        .get(0);
+    let cursors = tx
+        .query(
+            "SELECT cursor_value FROM sync_cursors WHERE stream_name=$1",
+            &[&stream],
+        )
+        .await?;
+    let cursor: String = cursors
+        .first()
+        .map(|row| row.get(0))
+        .unwrap_or_else(|| "0".into());
+    let cursor_end = if stream == "wireless.audit" {
+        tx.query(
+            "SELECT floor(extract(epoch FROM CAST($1 AS text)::timestamptz))::text",
+            &[&source.observed_at()],
+        )
+        .await?[0]
+            .get::<_, String>(0)
+    } else {
+        key.into()
+    };
+    tx.execute("WITH new_batch AS (
+        INSERT INTO sync_batches(batch_id,job_id,batch_no,payload_ref,status,row_count,attempt_count,dedupe_key,stream_name,cursor_start,cursor_end,created_at,updated_at)
+        VALUES ($1,$2,0,$3,'pending',1,0,$4,$5,$6,$7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+        ON CONFLICT(dedupe_key,stream_name) DO NOTHING
+        RETURNING 1
+    )
+    UPDATE sync_events SET status='batched',updated_at=CURRENT_TIMESTAMP
+    WHERE dedupe_key=$4 AND stream_name=$5 AND status<>'batched' AND EXISTS (SELECT 1 FROM new_batch)",
+        &[&batch_id,&persisted_job,&source.payload_ref(),&key,&stream,&cursor,&cursor_end]).await?;
+    Ok(())
 }
 
 async fn persisted_decision(
@@ -385,14 +381,14 @@ async fn hydrate(
     tx: &mut PgTransaction,
     record: &ResolvedScanRequestRecord,
     event_kind: Option<&str>,
-) -> Result<(), IntakeError> {
+) -> Result<bool, IntakeError> {
     let source = record.source();
     let updated = tx.execute("UPDATE sync_events SET payload=CAST($1 AS text)::jsonb,payload_sha256=$2,event_kind=COALESCE($3,event_kind),updated_at=CURRENT_TIMESTAMP WHERE dedupe_key=$4 AND stream_name=$5 AND payload_archived=false AND (payload IS NULL OR payload_sha256=$2) AND NOT EXISTS(SELECT 1 FROM sync_event_tombstones tombstone WHERE tombstone.dedupe_key=sync_events.dedupe_key AND tombstone.stream_name=sync_events.stream_name AND tombstone.expires_at>CURRENT_TIMESTAMP)",
         &[&record.payload_json(),&record.event_payload_sha256(),&event_kind,&source.dedupe_key(),&source.stream_name()]).await?;
     if updated > 0 && source.stream_name() == "wireless.audit" {
         wireless::hydrate(tx, source.dedupe_key(), record.payload_json()).await?;
     }
-    Ok(())
+    Ok(updated > 0)
 }
 
 async fn upsert_heartbeat(

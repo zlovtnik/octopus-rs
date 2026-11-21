@@ -1,6 +1,7 @@
 //! Real five-lane broker/application exercise, distinct from librdkafka mocks.
 mod support;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use futures_util::future::BoxFuture;
 use octopus::{
     config::{AppConfig, KafkaCfg},
@@ -11,12 +12,13 @@ use octopus::{
     load::LoadStore,
     postgres::PostgresErrorClass,
     processor::ProcessorId,
-    projections::{decode_wireless, ProjectionError, ProjectionStore},
+    projections::{decode_wireless, ProjectionError, ProjectionStore, WirelessObservation},
     runtime::{
-        consumer_workloads_observed, Backpressure, DispatchOutcome, OutboxPublisher, RuntimeError,
-        WirelessProjectionHandler, HEARTBEAT_TOPIC,
+        consumer_workloads_observed, Backpressure, DispatchOutcome, OutboxPublisher, Planner,
+        RuntimeError, WirelessProjectionHandler, HEARTBEAT_TOPIC,
     },
     supervision::Supervisor,
+    util::sha256_hex,
 };
 use rdkafka::{
     admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
@@ -61,15 +63,9 @@ async fn real_outbox_waits_for_broker_ack_and_retries_after_outage() {
     broker
         .create_topics(&[cfg.load_topic.clone(), cfg.result_topic.clone()])
         .await;
-    let publisher = OutboxPublisher::new(
-        DispatchStore::new(fixture.runtime.clone()),
-        &cfg,
-        "runtime-publisher".into(),
-        5,
-        1,
-        10,
-    )
-    .unwrap();
+    let dispatch = DispatchStore::new(fixture.runtime.clone());
+    let publisher =
+        OutboxPublisher::new(dispatch.clone(), &cfg, "runtime-publisher".into(), 5, 1, 10).unwrap();
     fixture.admin("INSERT INTO octopus_core.outbox_events(outbox_id,source_type,source_id,event_type,destination_topic,message_key,payload) VALUES(gen_random_uuid(),'test','result-1','result','sync.oracle.result','result-1','{\"value\":1}')");
     support::checked(Command::new("docker").args(["pause", &broker.name]));
     struct Resume(String);
@@ -85,12 +81,14 @@ async fn real_outbox_waits_for_broker_ack_and_retries_after_outage() {
     );
     let mut tx = fixture.runtime.begin_worker().await.unwrap();
     let row=tx.query("SELECT status,published_at IS NULL,attempt_count FROM outbox_events WHERE source_id='result-1'",&[]).await.unwrap();
-    assert_eq!(row[0].get::<_, String>(0), "pending");
+    // The publish deadline leaves an unacknowledged lease for backlog recovery.
+    assert_eq!(row[0].get::<_, String>(0), "leased");
     assert!(row[0].get::<_, bool>(1));
     assert_eq!(row[0].get::<_, i32>(2), 1);
     tx.commit().await.unwrap();
+    fixture.admin("UPDATE octopus_core.outbox_events SET lease_expires_at=clock_timestamp()-INTERVAL '1 second' WHERE source_id='result-1'");
+    assert_eq!(dispatch.recover_expired().await.unwrap(), 1);
     drop(resume);
-    tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(
         publisher.dispatch_next().await.unwrap(),
         DispatchOutcome::Dispatched
@@ -227,18 +225,17 @@ impl Broker {
 }
 struct Wireless(ProjectionStore);
 impl WirelessProjectionHandler for Wireless {
-    fn decode(&self, raw: &str) -> Result<Value, Poison> {
-        decode_wireless(raw).map_err(|e| Poison::invalid(e.to_string()))?;
-        serde_json::from_str(raw).map_err(|_| Poison::invalid("invalid wireless JSON"))
+    fn decode(&self, raw: &str) -> Result<WirelessObservation, Poison> {
+        decode_wireless(raw).map_err(|e| Poison::invalid(e.to_string()))
     }
     fn project<'a>(
         &'a self,
-        value: Value,
+        observation: WirelessObservation,
         metadata: BrokerRecordMetadata,
     ) -> BoxFuture<'a, Result<(), RuntimeError>> {
         Box::pin(async move {
             self.0
-                .project_wireless_record(value, &metadata)
+                .project_wireless_observation(observation, &metadata)
                 .await
                 .map(|_| ())
                 .map_err(|error| match error {
@@ -439,6 +436,19 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
     assert_eq!(counts[0].get::<_, i64>(1), 1);
     assert_eq!(counts[0].get::<_, i64>(2), 1);
     assert_eq!(counts[0].get::<_, i64>(3), 0);
+    let heartbeat_record = tx.query(
+        "SELECT
+            EXISTS(SELECT 1 FROM sync_events WHERE stream_name=$1 AND dedupe_key='heartbeat-1' AND status='completed'),
+            EXISTS(SELECT 1 FROM sync_batches WHERE stream_name=$1),
+            EXISTS(SELECT 1 FROM ingestion_evidence WHERE topic=$1 AND group_id=$2
+                   AND partition_id=0 AND record_offset=0 AND dedupe_key='heartbeat-1' AND payload_sha256=$3),
+            (SELECT next_offset FROM consumer_offsets WHERE topic=$1 AND group_id=$2 AND partition_id=0)",
+        &[&HEARTBEAT_TOPIC, &cfg.kafka.wireless_heartbeat_consumer, &sha256_hex(&heartbeat)],
+    ).await.unwrap();
+    assert!(heartbeat_record[0].get::<_, bool>(0));
+    assert!(!heartbeat_record[0].get::<_, bool>(1));
+    assert!(heartbeat_record[0].get::<_, bool>(2));
+    assert_eq!(heartbeat_record[0].get::<_, i64>(3), 1);
     tx.commit().await.unwrap();
 
     // Hold the ingestion table so we can observe intake before releasing it.
@@ -538,11 +548,117 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
         .get(0);
     assert_eq!(count, 2);
     tx.commit().await.unwrap();
+    drain_retained_batches(&fixture, &cfg, &observers[1].1, &observers[2].1).await;
     stop.cancel();
     tokio::time::timeout(Duration::from_secs(10), task)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(committed.0.load(Ordering::SeqCst), 7);
+    assert_eq!(committed.0.load(Ordering::SeqCst), 9);
+}
+
+async fn drain_retained_batches(
+    fixture: &support::Fixture,
+    config: &AppConfig,
+    load_observer: &BaseConsumer,
+    result_observer: &BaseConsumer,
+) {
+    let mut prior = config.clone();
+    prior
+        .ingest
+        .load_stream_names
+        .push(" wireless.audit ".into());
+    let dispatch = DispatchStore::new(fixture.runtime.clone());
+    dispatch
+        .ensure_cursors(&prior.ingest.load_stream_names)
+        .await
+        .unwrap();
+    let payload = json!({
+        "event_type": "frame",
+        "observed_at": chrono::Utc::now().to_rfc3339(),
+        "sensor_id": "retained-sensor",
+        "location_id": "lab",
+        "interface": "wlan0",
+        "channel": 6,
+        "frame_subtype": "beacon",
+        "raw_len": 128
+    });
+    let reference = format!(
+        "inline://json/{}",
+        URL_SAFE_NO_PAD.encode(payload.to_string())
+    );
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    let cursors = tx
+        .query(
+            "SELECT stream_name FROM sync_cursors WHERE btrim(stream_name)='wireless.audit'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(cursors.len(), 1);
+    assert_eq!(cursors[0].get::<_, String>(0), "wireless.audit");
+    tx.execute(
+        "INSERT INTO sync_events(dedupe_key,stream_name,payload_ref,observed_at,status)
+         VALUES('retained','wireless.audit',$1,CURRENT_TIMESTAMP,'pending')",
+        &[&reference],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let prior_planner = Planner::new(fixture.runtime.clone(), &prior);
+    assert_eq!(prior_planner.process_ingest().await.unwrap(), 1);
+
+    // The narrower policy stops planning new excluded work but drains batches
+    // the previous policy already admitted.
+    fixture.admin("INSERT INTO octopus_core.sync_events(dedupe_key,stream_name,payload_ref,observed_at,status) VALUES('new-excluded','wireless.audit','inline://json/e30',CURRENT_TIMESTAMP,'pending')");
+    let current_planner = Planner::new(fixture.runtime.clone(), config);
+    assert_eq!(current_planner.process_ingest().await.unwrap(), 0);
+    assert_eq!(
+        current_planner.reconcile_excluded_pending().await.unwrap(),
+        1
+    );
+    assert_eq!(dispatch.enqueue_pending(10, 5).await.unwrap(), 1);
+    assert_eq!(dispatch.enqueue_pending(10, 5).await.unwrap(), 0);
+    let publisher = OutboxPublisher::new(
+        dispatch,
+        &config.kafka,
+        "retained-publisher".into(),
+        30,
+        1,
+        10,
+    )
+    .unwrap();
+    assert_eq!(
+        publisher.dispatch_next().await.unwrap(),
+        DispatchOutcome::Dispatched
+    );
+    await_offset(load_observer, &config.kafka.load_topic, 2).await;
+    assert_eq!(
+        publisher.dispatch_next().await.unwrap(),
+        DispatchOutcome::Dispatched
+    );
+    await_offset(result_observer, &config.kafka.result_topic, 2).await;
+
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    let rows = tx.query(
+        "SELECT batch.status, batch.row_count, event.status FROM sync_batches batch
+         JOIN sync_events event ON event.stream_name=batch.stream_name AND event.dedupe_key=batch.dedupe_key
+         WHERE batch.stream_name='wireless.audit' AND batch.dedupe_key='retained'",
+        &[],
+    ).await.unwrap();
+    assert_eq!(rows[0].get::<_, String>(0), "completed");
+    assert_eq!(rows[0].get::<_, i32>(1), 1);
+    assert_eq!(rows[0].get::<_, String>(2), "completed");
+    let excluded = tx
+        .query(
+            "SELECT status, EXISTS(SELECT 1 FROM sync_batches WHERE dedupe_key='new-excluded')
+         FROM sync_events WHERE stream_name='wireless.audit' AND dedupe_key='new-excluded'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(excluded[0].get::<_, String>(0), "completed");
+    assert!(!excluded[0].get::<_, bool>(1));
+    tx.commit().await.unwrap();
 }

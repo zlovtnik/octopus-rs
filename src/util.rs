@@ -29,7 +29,12 @@ pub fn utf16_length(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
-/// Equivalent to UUID.nameUUIDFromBytes, without UUID namespace framing.
+/// Equivalent to Java's UUID.nameUUIDFromBytes for the supplied bytes.
+pub(crate) fn java_name_uuid(value: &[u8]) -> String {
+    md5_uuid(Md5::digest(value).into())
+}
+
+/// A name UUID over the coordinator's namespace and byte-length-framed parts.
 pub fn stable_uuid(namespace: &str, parts: &[&str]) -> String {
     let prefix = format!("{namespace}:v2");
     let mut digest = Md5::new();
@@ -37,7 +42,10 @@ pub fn stable_uuid(namespace: &str, parts: &[&str]) -> String {
         digest.update(format!("{}:", value.len()).as_bytes());
         digest.update(value.as_bytes());
     }
-    let mut bytes: [u8; 16] = digest.finalize().into();
+    md5_uuid(digest.finalize().into())
+}
+
+fn md5_uuid(mut bytes: [u8; 16]) -> String {
     bytes[6] = (bytes[6] & 0x0f) | 0x30;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     uuid::Uuid::from_bytes(bytes).to_string()

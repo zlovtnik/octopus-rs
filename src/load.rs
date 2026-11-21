@@ -1,12 +1,23 @@
 //! Authorized, atomic typed loads and durable result transitions.
 use crate::{
-    domain::{BrokerRecordMetadata, PostgresResult, SyncLoad},
-    postgres::{PgError, PgRuntime, PgTransaction, PostgresErrorClass},
+    domain::{BrokerRecordMetadata, IngestionDisposition, PostgresResult, SyncLoad},
+    postgres::{
+        retry_broker_transaction, BrokerEvidenceError, PgError, PgRuntime, PgTransaction,
+        PostgresErrorClass,
+    },
     util::{java_is_blank, stable_uuid},
+};
+use base64::{
+    alphabet,
+    engine::{
+        general_purpose::{GeneralPurpose, GeneralPurposeConfig},
+        DecodePaddingMode,
+    },
+    Engine,
 };
 use chrono::Utc;
 use serde_json::Value;
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 mod rows;
 mod sink;
@@ -26,6 +37,18 @@ pub enum LoadError {
     MissingPayload,
     #[error(transparent)]
     Database(#[from] PgError),
+}
+
+impl From<BrokerEvidenceError> for LoadError {
+    fn from(error: BrokerEvidenceError) -> Self {
+        match error {
+            BrokerEvidenceError::Database(error) => Self::Database(error),
+            BrokerEvidenceError::Conflict => {
+                Self::Invariant("broker coordinate changed after ingestion")
+            }
+            BrokerEvidenceError::Missing => Self::Invariant("evidence disappeared after upsert"),
+        }
+    }
 }
 impl LoadError {
     pub fn is_retryable(&self) -> bool {
@@ -128,7 +151,14 @@ impl LoadStore {
                     error
                 }
             })?;
-        retry_with(3, 200, || self.insert_payload(load, target, &payload)).await
+        for delay in [Duration::from_millis(200), Duration::from_millis(400)] {
+            let result = self.insert_payload(load, target, &payload).await;
+            if !result.as_ref().err().is_some_and(LoadError::is_retryable) {
+                return result;
+            }
+            tokio::time::sleep(delay).await;
+        }
+        self.insert_payload(load, target, &payload).await
     }
 
     async fn insert_payload(
@@ -219,7 +249,11 @@ impl LoadStore {
         &self,
         records: &[(&SyncLoad, &PostgresResult, &BrokerRecordMetadata)],
     ) -> Result<(), LoadError> {
-        retry(|| self.record_load_results_once(records)).await
+        retry_broker_transaction(
+            || self.record_load_results_once(records),
+            LoadError::is_retryable,
+        )
+        .await
     }
 
     async fn record_load_results_once(
@@ -237,9 +271,10 @@ impl LoadStore {
                 return Err(LoadError::Invalid("load/result identity mismatch"));
             }
             let key = format!("load:{}:{}", load.batch_id, load.attempt.max(1));
-            if !verify_evidence(&mut tx, metadata, &key).await? {
+            if !tx.check_broker_evidence(metadata, &key).await? {
                 enqueue_result(&mut tx, result, load.attempt).await?;
-                persist_evidence(&mut tx, metadata, &key).await?;
+                tx.record_broker_evidence(metadata, &key, IngestionDisposition::Processed)
+                    .await?;
             }
         }
         tx.commit().await?;
@@ -257,7 +292,11 @@ impl LoadStore {
         &self,
         records: &[(&PostgresResult, &BrokerRecordMetadata)],
     ) -> Result<(), LoadError> {
-        retry(|| self.record_results_once(records)).await
+        retry_broker_transaction(
+            || self.record_results_once(records),
+            LoadError::is_retryable,
+        )
+        .await
     }
 
     async fn record_results_once(
@@ -286,9 +325,10 @@ impl LoadStore {
                 .filter(|n| *n > 0)
                 .unwrap_or(1);
             let key = format!("result:{}:{attempt}", result.batch_id);
-            if !verify_evidence(&mut tx, metadata, &key).await? {
+            if !tx.check_broker_evidence(metadata, &key).await? {
                 apply_result(&mut tx, result, attempt).await?;
-                persist_evidence(&mut tx, metadata, &key).await?;
+                tx.record_broker_evidence(metadata, &key, IngestionDisposition::Processed)
+                    .await?;
             }
         }
         tx.commit().await?;
@@ -296,65 +336,26 @@ impl LoadStore {
     }
 }
 
-pub(crate) async fn retry<T, F, Fut>(mut operation: F) -> Result<T, LoadError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, LoadError>>,
-{
-    retry_with(5, 25, &mut operation).await
-}
-
-async fn retry_with<T, F, Fut>(
-    attempts: u32,
-    base_ms: u64,
-    mut operation: F,
-) -> Result<T, LoadError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, LoadError>>,
-{
-    for attempt in 0..attempts {
-        let result = operation().await;
-        if result.as_ref().err().is_some_and(LoadError::is_retryable) && attempt + 1 < attempts {
-            let base = base_ms << attempt;
-            let random = uuid::Uuid::new_v4();
-            let jitter = if base_ms == 25 {
-                u64::from_le_bytes(random.as_bytes()[..8].try_into().expect("UUID length")) % base
-            } else {
-                0
-            };
-            tokio::time::sleep(std::time::Duration::from_millis(base + jitter)).await;
-        } else {
-            return result;
-        }
-    }
-    unreachable!("bounded retry always returns final attempt")
-}
-
 pub fn resolve_local_payload(
     reference: &str,
     outbox_dir: &std::path::Path,
 ) -> Result<String, LoadError> {
     if let Some(encoded) = reference.strip_prefix("inline://json/") {
+        const INLINE_BASE64: GeneralPurpose = GeneralPurpose::new(
+            &alphabet::URL_SAFE,
+            GeneralPurposeConfig::new()
+                .with_decode_allow_trailing_bits(true)
+                .with_decode_padding_mode(DecodePaddingMode::RequireNone),
+        );
         let unpadded = encoded.trim_end_matches('=');
-        if encoded.len() - unpadded.len() > 2
-            || !unpadded
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            || unpadded.len() % 4 == 1
-        {
+        // Accept missing or partial padding up to the next complete quartet.
+        let required_padding = (4 - unpadded.len() % 4) % 4;
+        if encoded.len() - unpadded.len() > required_padding {
             return Err(LoadError::Invalid("invalid inline payload encoding"));
         }
-        let mut encoded = encoded.replace('-', "+").replace('_', "/");
-        while !encoded.len().is_multiple_of(4) {
-            encoded.push('=');
-        }
-        let padding = encoded.bytes().rev().take_while(|c| *c == b'=').count();
-        let decoded = openssl::base64::decode_block(&encoded)
+        let decoded = INLINE_BASE64
+            .decode(unpadded)
             .map_err(|_| LoadError::Invalid("invalid inline payload encoding"))?;
-        if padding > 2 {
-            return Err(LoadError::Invalid("invalid inline payload encoding"));
-        }
         return Ok(String::from_utf8_lossy(&decoded).into_owned());
     }
     if let Some(relative) = reference.strip_prefix("outbox://") {
@@ -499,35 +500,6 @@ fn validate_metadata(m: &BrokerRecordMetadata) -> Result<(), LoadError> {
     } else {
         Ok(())
     }
-}
-async fn verify_evidence(
-    tx: &mut PgTransaction,
-    m: &BrokerRecordMetadata,
-    key: &str,
-) -> Result<bool, LoadError> {
-    let rows=tx.query("SELECT payload_sha256,dedupe_key FROM ingestion_evidence WHERE topic=$1 AND partition_id=$2 AND record_offset=$3 AND group_id=$4",&[&m.topic,&m.partition,&m.offset,&m.consumer_group]).await?;
-    if let Some(row) = rows.first() {
-        if row.get::<_, String>(0) != m.payload_sha256 || row.get::<_, String>(1) != key {
-            return Err(LoadError::Invariant(
-                "broker coordinate changed after ingestion",
-            ));
-        }
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-async fn persist_evidence(
-    tx: &mut PgTransaction,
-    m: &BrokerRecordMetadata,
-    key: &str,
-) -> Result<(), LoadError> {
-    tx.execute("INSERT INTO ingestion_evidence(topic,partition_id,record_offset,group_id,group_version,artifact_sha256,message_key,payload_sha256,disposition,dedupe_key,first_seen_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'processed',$9,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT ON CONSTRAINT ingestion_evidence_pkey DO UPDATE SET updated_at=CURRENT_TIMESTAMP",&[&m.topic,&m.partition,&m.offset,&m.consumer_group,&m.group_version.to_string(),&m.artifact_sha256,&m.message_key,&m.payload_sha256,&key]).await?;
-    if !verify_evidence(tx, m, key).await? {
-        return Err(LoadError::Invariant("evidence disappeared after upsert"));
-    }
-    tx.execute("INSERT INTO consumer_offsets(group_id,topic,partition_id,next_offset,group_version,artifact_sha256,updated_at) VALUES($1,$2,$3,$4,$5,$6,CURRENT_TIMESTAMP) ON CONFLICT(group_id,topic,partition_id) DO UPDATE SET next_offset=GREATEST(consumer_offsets.next_offset,EXCLUDED.next_offset),group_version=CASE WHEN EXCLUDED.next_offset>consumer_offsets.next_offset THEN EXCLUDED.group_version ELSE consumer_offsets.group_version END,artifact_sha256=CASE WHEN EXCLUDED.next_offset>consumer_offsets.next_offset THEN EXCLUDED.artifact_sha256 ELSE consumer_offsets.artifact_sha256 END,updated_at=CURRENT_TIMESTAMP",&[&m.consumer_group,&m.topic,&m.partition,&m.offset.wrapping_add(1),&m.group_version.to_string(),&m.artifact_sha256]).await?;
-    Ok(())
 }
 async fn enqueue_result(
     tx: &mut PgTransaction,

@@ -264,7 +264,15 @@ async fn compact_projection_replay_conflict_window_and_expiry_are_atomic() {
         )
         .await
         .unwrap());
-    fixture.admin("UPDATE atheros_search.wireless_observation_summaries SET expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second'; UPDATE octopus_core.wireless_projection_group_receipts SET expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second'; UPDATE octopus_core.wireless_projection_hashes SET expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second';");
+    // Expire the summary while preserving the schema's seven-day window TTL.
+    fixture.admin(
+        "UPDATE atheros_search.wireless_observation_summaries
+         SET window_start=window_start-INTERVAL '8 days', window_end=window_end-INTERVAL '8 days',
+             first_seen=first_seen-INTERVAL '8 days', last_seen=last_seen-INTERVAL '8 days',
+             expires_at=expires_at-INTERVAL '8 days';
+         UPDATE octopus_core.wireless_projection_group_receipts SET expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second';
+         UPDATE octopus_core.wireless_projection_hashes SET expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second';",
+    );
     assert_eq!(store.expire_wireless_projections(10).await.unwrap(), 1);
     let mut tx = runtime.begin_worker().await.unwrap();
     assert!(tx.query(

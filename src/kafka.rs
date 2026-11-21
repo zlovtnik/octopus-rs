@@ -230,6 +230,19 @@ pub async fn finish_durable(
     }
 }
 
+pub(crate) fn durable_consumer_settings(bootstrap_servers: &str, group: &str) -> ClientConfig {
+    let mut settings = ClientConfig::new();
+    settings
+        .set("bootstrap.servers", bootstrap_servers)
+        .set("group.id", group)
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("isolation.level", "read_committed")
+        .set("allow.auto.create.topics", "false");
+    settings
+}
+
 pub fn consumer_settings(cfg: &KafkaCfg, group: &str) -> Result<ClientConfig, BoundaryError> {
     if cfg.locked_batch_max_bytes <= 0
         || cfg.max_poll_records <= 0
@@ -240,15 +253,8 @@ pub fn consumer_settings(cfg: &KafkaCfg, group: &str) -> Result<ClientConfig, Bo
             "batch and polling bounds must be positive".into(),
         ));
     }
-    let mut settings = ClientConfig::new();
+    let mut settings = durable_consumer_settings(&cfg.bootstrap_servers, group);
     settings
-        .set("bootstrap.servers", &cfg.bootstrap_servers)
-        .set("group.id", group)
-        .set("auto.offset.reset", "earliest")
-        .set("enable.auto.commit", "false")
-        .set("enable.auto.offset.store", "false")
-        .set("isolation.level", "read_committed")
-        .set("allow.auto.create.topics", "false")
         .set("fetch.max.bytes", cfg.locked_batch_max_bytes.to_string())
         .set(
             "max.partition.fetch.bytes",

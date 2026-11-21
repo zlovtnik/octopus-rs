@@ -1,7 +1,6 @@
 use super::LoadError;
-use crate::util::{inspect_payload, sha256_hex, stable_uuid};
+use crate::util::{inspect_payload, java_name_uuid, sha256_hex, stable_uuid};
 use chrono::DateTime;
-use md5::{Digest, Md5};
 use serde_json::{json, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,12 +336,6 @@ fn copy_longs(out: &mut Value, row: &Value, keys: &[&str]) {
         out[*key] = json!(long(row, key));
     }
 }
-fn name_uuid(value: &str) -> String {
-    let mut bytes: [u8; 16] = Md5::digest(value.as_bytes()).into();
-    bytes[6] = (bytes[6] & 15) | 48;
-    bytes[8] = (bytes[8] & 63) | 128;
-    uuid::Uuid::from_bytes(bytes).to_string()
-}
 fn band(channel: i64) -> &'static str {
     if (1..=14).contains(&channel) {
         "2.4GHz"
@@ -370,7 +363,7 @@ pub fn transform(
                 Some(s) => uuid::Uuid::parse_str(&s)
                     .map_err(|_| LoadError::Invalid("invalid event UUID"))?
                     .to_string(),
-                None => name_uuid(&raw),
+                None => java_name_uuid(raw.as_bytes()),
             };
             let time = required_timestamp(row, "time")?;
             let kind = required_string(row, "type")?;
@@ -423,7 +416,7 @@ pub fn transform(
             }
         }
         SinkTarget::ProxyPayloadAudit => {
-            out = json!({"correlation_id":string(row,"correlation_id").unwrap_or_else(||name_uuid(&row.to_string())),"host":required_string(row,"host")?,"direction":string(row,"direction").unwrap_or_else(||"UP".into()).to_uppercase(),"captured_at":required_timestamp(row,"observed_at")?,"byte_offset":long(row,"byte_offset").unwrap_or(0),"is_encrypted":boolean(row,"is_encrypted"),"truncated":boolean(row,"truncated"),"http_status":long(row,"http_status").or_else(||long(row,"status_code")),"http_method":string(row,"method"),"http_path":string(row,"path")});
+            out = json!({"correlation_id":string(row,"correlation_id").unwrap_or_else(||java_name_uuid(row.to_string().as_bytes())),"host":required_string(row,"host")?,"direction":string(row,"direction").unwrap_or_else(||"UP".into()).to_uppercase(),"captured_at":required_timestamp(row,"observed_at")?,"byte_offset":long(row,"byte_offset").unwrap_or(0),"is_encrypted":boolean(row,"is_encrypted"),"truncated":boolean(row,"truncated"),"http_status":long(row,"http_status").or_else(||long(row,"status_code")),"http_method":string(row,"method"),"http_path":string(row,"path")});
             copy_strings(
                 &mut out,
                 row,

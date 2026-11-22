@@ -1,5 +1,11 @@
 use super::*;
 use crate::config::DqConfig;
+use std::time::Duration;
+use tokio::time::Instant;
+
+const RETENTION_BUDGET: Duration = Duration::from_secs(240);
+const ARTIFACT_BATCH_SIZE: usize = 100;
+
 pub fn allowed_key(key: &str, config: &DqConfig) -> bool {
     let parts = key.split('/').collect::<Vec<_>>();
     let scoped = parts.first().copied() == Some(config.installation_id.as_str())
@@ -32,10 +38,12 @@ const CLOSE: &str = r#"WITH eligible AS(SELECT r.run_id,GREATEST(r.completed_at,
 // deadlines keep the usual review and accessibility behavior until claimed.
 // Keep legacy shared versions until conflicting ownership is repaired.
 const EXPIRED: &str = r#"
-  SELECT a.artifact_id
+  SELECT a.artifact_id, a.run_id, a.reference, a.retained_until::text AS cursor_time,
+         a.retained_until = '-infinity'::timestamptz AS already_claimed
   FROM octopus_core.dq_artifacts a JOIN octopus_core.dq_runs r ON r.run_id = a.run_id
   WHERE a.installation_id = $1 AND a.namespace = $2
     AND ($4::text IS NULL OR a.artifact_id = $4)
+    AND ($5::text IS NULL OR (a.retained_until, a.artifact_id) > ($5::text::timestamptz, $6::text))
     AND a.retained_until <= CURRENT_TIMESTAMP
     AND (a.retained_until = '-infinity'::timestamptz OR (
       r.status IN ('succeeded','failed','cancelled')
@@ -68,12 +76,12 @@ const EXPIRED: &str = r#"
         AND (other.input_refs @> alias.ref OR other.output_refs @> alias.ref)
     )
   ORDER BY a.retained_until, a.artifact_id
-  LIMIT $3 FOR UPDATE OF a SKIP LOCKED"#;
+  LIMIT $3"#;
 
 const MARK_EXPIRED: &str = r#"
 UPDATE octopus_core.dq_artifacts a SET retained_until = '-infinity'::timestamptz
 FROM expired WHERE a.artifact_id = expired.artifact_id
-RETURNING a.run_id, a.reference"#;
+RETURNING a.run_id, a.reference, expired.already_claimed"#;
 
 const UNLINK_EXPIRED: &str = r#"
 UPDATE octopus_core.dq_runs r
@@ -91,6 +99,16 @@ impl DqStore {
         artifacts: &artifacts::DqArtifacts,
         config: &DqConfig,
     ) -> Result<u64> {
+        self.retention_batch_before(artifacts, config, Instant::now() + RETENTION_BUDGET)
+            .await
+    }
+
+    async fn retention_batch_before(
+        &self,
+        artifacts: &artifacts::DqArtifacts,
+        config: &DqConfig,
+        deadline: Instant,
+    ) -> Result<u64> {
         let mut tx = self.transaction().await?;
         let mut changed = 0;
         for sql in [REOPEN, CLOSE] {
@@ -106,23 +124,57 @@ impl DqStore {
                 .await
                 .map_err(database)?;
         }
-        let rows = tx
-            .query(
-                EXPIRED,
-                &[
-                    &self.settings.installation_id,
-                    &self.settings.namespace,
-                    &100i64,
-                    &None::<&str>,
-                ],
-            )
-            .await
-            .map_err(database)?;
-        tx.commit().await.map_err(database)?;
+        // Page past invalid durable claims without spending a slot on them.
+        let expired = format!("{EXPIRED} FOR UPDATE OF a SKIP LOCKED");
+        let mut selected = Vec::with_capacity(ARTIFACT_BATCH_SIZE);
+        let (mut cursor_time, mut cursor_id): (Option<String>, Option<String>) = (None, None);
+        loop {
+            let rows = tx
+                .query(
+                    &expired,
+                    &[
+                        &self.settings.installation_id,
+                        &self.settings.namespace,
+                        &(ARTIFACT_BATCH_SIZE as i64),
+                        &None::<&str>,
+                        &cursor_time,
+                        &cursor_id,
+                    ],
+                )
+                .await
+                .map_err(database)?;
+            tx.commit().await.map_err(database)?;
+            for row in &rows {
+                let artifact: String = row.get("artifact_id");
+                let already_claimed: bool = row.get("already_claimed");
+                if already_claimed {
+                    let run: String = row.get("run_id");
+                    let reference: Value = row.get("reference");
+                    match reference_key(&reference, &run, config) {
+                        Ok(_) => {}
+                        Err(e) if e.status < 500 => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                selected.push(artifact);
+                if selected.len() == ARTIFACT_BATCH_SIZE {
+                    break;
+                }
+            }
+            if selected.len() == ARTIFACT_BATCH_SIZE
+                || rows.len() < ARTIFACT_BATCH_SIZE
+                || Instant::now() >= deadline
+            {
+                break;
+            }
+            let last = &rows[ARTIFACT_BATCH_SIZE - 1];
+            cursor_time = Some(last.get("cursor_time"));
+            cursor_id = Some(last.get("artifact_id"));
+            tx = self.transaction().await?;
+        }
 
-        let claim_expired = format!("WITH expired AS ({EXPIRED}) {MARK_EXPIRED}");
-        for row in rows {
-            let artifact: String = row.get(0);
+        let claim_expired = format!("WITH expired AS ({expired}) {MARK_EXPIRED}");
+        for artifact in selected {
             let mut tx = self.transaction().await?;
             let claimed = tx
                 .query(
@@ -132,6 +184,8 @@ impl DqStore {
                         &self.settings.namespace,
                         &1i64,
                         &artifact,
+                        &None::<&str>,
+                        &None::<&str>,
                     ],
                 )
                 .await
@@ -142,6 +196,7 @@ impl DqStore {
             };
             let run: String = row.get(0);
             let reference: Value = row.get(1);
+            let already_claimed: bool = row.get(2);
             tx.execute(UNLINK_EXPIRED, &[&artifact])
                 .await
                 .map_err(database)?;
@@ -158,7 +213,10 @@ impl DqStore {
                         Err(_) => return Err(error(503, "retention_dependency_failure")),
                     }
                 }
-                Err(e) if e.status < 500 => continue,
+                Err(e) if e.status < 500 => {
+                    changed += u64::from(!already_claimed);
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
             let mut tx = self.transaction().await?;
@@ -198,10 +256,13 @@ impl DqStore {
         artifacts: &artifacts::DqArtifacts,
         config: &DqConfig,
     ) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(240);
+        let deadline = Instant::now() + RETENTION_BUDGET;
         loop {
-            if self.retention_batch(artifacts, config).await? == 0
-                || tokio::time::Instant::now() >= deadline
+            if self
+                .retention_batch_before(artifacts, config, deadline)
+                .await?
+                == 0
+                || Instant::now() >= deadline
             {
                 break;
             }

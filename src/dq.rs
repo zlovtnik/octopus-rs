@@ -537,6 +537,7 @@ pub fn validate_artifacts(
         if !identifier(text(item, "artifact_id")?)
             || !hash(text(item, "sha256")?)
             || java_is_blank(text(item, "version_id")?)
+            || text(item, "version_id")? == "null"
             || java_is_blank(text(item, "etag")?)
             || long(item, "size_bytes")? < 0
         {
@@ -547,7 +548,7 @@ pub fn validate_artifacts(
             settings.artifact_bucket, settings.installation_id, settings.namespace
         );
         let permitted = if input {
-            format!("{prefix}inputs/")
+            format!("{prefix}inputs/{run_id}/")
         } else {
             format!(
                 "{prefix}runs/{run_id}/attempts/{}/",
@@ -555,7 +556,7 @@ pub fn validate_artifacts(
             )
         };
         let uri = text(item, "uri")?;
-        if !uri.starts_with(&permitted) || uri.contains("..") || uri.contains(['?', '#', '@']) {
+        if !uri.strip_prefix(&permitted).is_some_and(identifier) || uri.contains("..") {
             return Err(DqError::new(403, "forbidden_artifact_reference"));
         }
         if !input

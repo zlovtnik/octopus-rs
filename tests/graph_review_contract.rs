@@ -389,3 +389,95 @@ async fn signal_count_mismatches_remain_partial_until_each_bucket_is_repaired() 
     )
     .await;
 }
+
+#[tokio::test]
+async fn channel_only_evidence_counts_separately_only_when_its_time_window_is_unresolved() {
+    let Some(fixture) = Fixture::start().await else {
+        return;
+    };
+    let store = ProjectionStore::new(fixture.runtime.clone());
+    fixture.admin(
+        "INSERT INTO octopus_core.devices(mac_id,mac_hint)
+         SELECT mac,mac FROM unnest(ARRAY['02:00:00:00:00:01','02:00:00:00:00:02']) mac;
+         INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,observed_at)
+         SELECT device || '-' || kind, '02:00:00:00:00:0' || device,
+                CASE WHEN kind='unknown' THEN '2026-09-20 13:05:00+00'::timestamptz
+                     ELSE '2026-09-20 13:00:00+00'::timestamptz END
+         FROM unnest(ARRAY['1','2']) device CROSS JOIN unnest(ARRAY['low','high','unknown']) kind;
+         INSERT INTO octopus_core.wireless_frame_radio(dedupe_key,channel_number,frequency_mhz)
+         SELECT dedupe_key,1,CASE WHEN dedupe_key LIKE '%low' THEN 2412
+                                WHEN dedupe_key LIKE '%high' THEN 5955 END
+         FROM octopus_core.wireless_frames",
+    );
+    store.project_infrastructure_graph(10).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT weight=2 AND evidence->>'channels'='2412 MHz,5955 MHz'
+                AND observed_at='2026-09-20 13:05:00+00'
+         FROM atheros_search.graph_edges WHERE edge_kind='same_channel'",
+    )
+    .await;
+
+    fixture.admin(
+        "INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,observed_at)
+         SELECT device || '-unknown11','02:00:00:00:00:0' || device,'2026-09-20 13:05:00+00'
+         FROM unnest(ARRAY['1','2']) device;
+         INSERT INTO octopus_core.wireless_frame_radio(dedupe_key,channel_number)
+         SELECT dedupe_key,11 FROM octopus_core.wireless_frames WHERE dedupe_key LIKE '%unknown11'",
+    );
+    store.project_infrastructure_graph(10).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT weight=3 AND evidence->>'channels'='2412 MHz,5955 MHz,channel 11'
+         FROM atheros_search.graph_edges WHERE edge_kind='same_channel'",
+    )
+    .await;
+
+    fixture.admin(
+        "INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,observed_at)
+         SELECT device || '-unresolved','02:00:00:00:00:0' || device,'2026-09-20 14:00:00+00'
+         FROM unnest(ARRAY['1','2']) device;
+         INSERT INTO octopus_core.wireless_frame_radio(dedupe_key,channel_number)
+         SELECT dedupe_key,1 FROM octopus_core.wireless_frames WHERE dedupe_key LIKE '%unresolved'",
+    );
+    store.project_infrastructure_graph(10).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT weight=4 AND evidence->>'channels'='2412 MHz,5955 MHz,channel 1,channel 11'
+                AND observed_at='2026-09-20 14:00:00+00'
+         FROM atheros_search.graph_edges WHERE edge_kind='same_channel'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn signal_timestamp_mismatches_remain_partial_until_each_bucket_is_repaired() {
+    let Some(fixture) = Fixture::start().await else {
+        return;
+    };
+    let store = ProjectionStore::new(fixture.runtime.clone());
+    fixture.admin(
+        "INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,bssid,observed_at) VALUES
+         ('a','02:00:00:00:00:01','12:00:00:00:00:01',CURRENT_TIMESTAMP),
+         ('b','02:00:00:00:00:02','12:00:00:00:00:01',CURRENT_TIMESTAMP)",
+    );
+    store.project_infrastructure_graph(10).await.unwrap();
+    fixture.admin(
+        "UPDATE atheros_search.wireless_signal_summaries
+         SET last_observed_at=last_observed_at-INTERVAL '1 minute'",
+    );
+    store.project_infrastructure_graph(1).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT coverage_status='partial' AND projection_watermark_at=source_watermark_at
+         FROM atheros_search.investigation_watermarks WHERE projection_name='wireless_evidence'",
+    )
+    .await;
+    store.project_infrastructure_graph(1).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT coverage_status='complete' AND projection_watermark_at=source_watermark_at
+         FROM atheros_search.investigation_watermarks WHERE projection_name='wireless_evidence'",
+    )
+    .await;
+}

@@ -439,14 +439,32 @@ pub(super) const UPSERT_SAME_CHANNEL_EDGES: &str = r#"WITH observations AS MATER
                                     WHERE node.node_id = CONCAT('device:', frame.source_mac)
                                   )
                                 GROUP BY frame.source_mac, radio.channel_number, radio.frequency_mhz
+                              ), unresolved_channels AS MATERIALIZED (
+                                SELECT left_observation.source_mac AS left_mac,
+                                       right_observation.source_mac AS right_mac,
+                                       left_observation.channel_number
+                                FROM observations left_observation
+                                JOIN observations right_observation
+                                  ON right_observation.source_mac > left_observation.source_mac
+                                 AND right_observation.channel_number = left_observation.channel_number
+                                 AND left_observation.observed_times && right_observation.overlap_windows
+                                WHERE left_observation.frequency_mhz IS NULL AND right_observation.frequency_mhz IS NULL
                               ), matches AS MATERIALIZED (
                                 SELECT left_observation.source_mac AS left_mac,
                                        right_observation.source_mac AS right_mac,
+                                       left_observation.channel_number AS left_channel,
+                                       right_observation.channel_number AS right_channel,
+                                       COALESCE(left_observation.frequency_mhz, right_observation.frequency_mhz) AS frequency_mhz,
+                                       -- Keep point sets only where channel-only evidence needs resolution.
+                                       CASE WHEN unresolved_left.channel_number IS NOT NULL
+                                              OR unresolved_right.channel_number IS NOT NULL THEN (left_observation.observed_times * right_observation.overlap_windows)
+                                                + (right_observation.observed_times * left_observation.overlap_windows)
+                                       END AS matched_times,
+                                       GREATEST(upper(left_observation.observed_times * right_observation.overlap_windows),
+                                                upper(right_observation.observed_times * left_observation.overlap_windows)) AS last_observed,
                                        COALESCE(left_observation.frequency_mhz::text || ' MHz',
                                               right_observation.frequency_mhz::text || ' MHz',
-                                              'channel ' || left_observation.channel_number::text) AS shared_key,
-                                       GREATEST(upper(left_observation.observed_times * right_observation.overlap_windows),
-                                                upper(right_observation.observed_times * left_observation.overlap_windows)) AS last_observed
+                                              'channel ' || left_observation.channel_number::text) AS shared_key
                               FROM observations left_observation
                               JOIN observations right_observation
                                 ON right_observation.source_mac > left_observation.source_mac
@@ -456,6 +474,36 @@ pub(super) const UPSERT_SAME_CHANNEL_EDGES: &str = r#"WITH observations AS MATER
                                      AND left_observation.frequency_mhz = right_observation.frequency_mhz)
                                  OR ((left_observation.frequency_mhz IS NULL OR right_observation.frequency_mhz IS NULL)
                                      AND left_observation.channel_number = right_observation.channel_number))
+                              LEFT JOIN unresolved_channels unresolved_left
+                                ON unresolved_left.left_mac = left_observation.source_mac
+                               AND unresolved_left.right_mac = right_observation.source_mac
+                               AND unresolved_left.channel_number = left_observation.channel_number
+                              LEFT JOIN unresolved_channels unresolved_right
+                                ON unresolved_right.left_mac = left_observation.source_mac
+                               AND unresolved_right.right_mac = right_observation.source_mac
+                               AND unresolved_right.channel_number = right_observation.channel_number
+                              ), resolved_channels AS (
+                                -- Expand time ranges only for channels with unresolved evidence.
+                                SELECT match.left_mac, match.right_mac, unresolved.channel_number,
+                                       range_agg(tstzrange(lower(observed_time) - INTERVAL '10 minutes',
+                                                          upper(observed_time) + INTERVAL '10 minutes', '[]')) AS resolved_windows
+                                FROM matches match
+                                JOIN unresolved_channels unresolved
+                                  ON unresolved.left_mac = match.left_mac AND unresolved.right_mac = match.right_mac
+                                 AND unresolved.channel_number IN (match.left_channel, match.right_channel)
+                                CROSS JOIN LATERAL unnest(match.matched_times) observed_time
+                                WHERE match.frequency_mhz IS NOT NULL
+                                GROUP BY match.left_mac, match.right_mac, unresolved.channel_number
+                              ), classified AS (
+                                -- Keep the timestamp even when its channel key is already resolved.
+                                SELECT match.left_mac, match.right_mac, match.last_observed,
+                                       CASE WHEN match.frequency_mhz IS NULL
+                                              AND match.matched_times <@ resolved.resolved_windows
+                                            THEN NULL ELSE match.shared_key END AS shared_key
+                                FROM matches match
+                                LEFT JOIN resolved_channels resolved
+                                  ON resolved.left_mac = match.left_mac AND resolved.right_mac = match.right_mac
+                                 AND resolved.channel_number = match.left_channel
                               )
                               INSERT INTO atheros_search.graph_edges (
                                   edge_id, source_node_id, target_node_id, edge_kind,
@@ -473,7 +521,7 @@ pub(super) const UPSERT_SAME_CHANNEL_EDGES: &str = r#"WITH observations AS MATER
                                          COUNT(DISTINCT shared_key) AS shared_channels,
                                          string_agg(DISTINCT shared_key, ',' ORDER BY shared_key) AS channel_list,
                                          MAX(last_observed) AS last_observed
-                                  FROM matches
+                                  FROM classified
                                   GROUP BY left_mac, right_mac
                                 ) pair
                                 LEFT JOIN atheros_search.graph_edges existing
@@ -708,7 +756,8 @@ pub(super) const UPSERT_WIRELESS_EVIDENCE_WATERMARK: &str = r#"WITH buckets AS (
                             SELECT MAX(bucket.last_observed_at) AS source_watermark_at,
                                    MAX(summary.last_observed_at) AS projection_watermark_at,
                                    MAX(summary.projected_at) AS last_projected_at,
-                                   COUNT(*) FILTER (WHERE summary.frame_count IS DISTINCT FROM bucket.retained_count) AS missing_buckets
+                                   COUNT(*) FILTER (WHERE summary.frame_count IS DISTINCT FROM bucket.retained_count
+                                                       OR summary.last_observed_at IS DISTINCT FROM bucket.last_observed_at) AS missing_buckets
                             FROM buckets bucket
                             LEFT JOIN atheros_search.wireless_signal_summaries summary
                               USING (window_start, sensor_id, bssid, source_mac)

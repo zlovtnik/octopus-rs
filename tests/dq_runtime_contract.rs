@@ -331,6 +331,78 @@ async fn durable_control_scope_fences_receipts_and_rollback() {
 }
 
 #[tokio::test]
+async fn artifact_admission_requires_an_unclaimed_run_owned_version() {
+    let Some(fixture) = support::Fixture::start().await else {
+        return;
+    };
+    let store = DqStore::new(fixture.runtime.clone(), settings());
+    store.reconcile_policies().await.unwrap();
+    let principal = actor();
+    store.register(&principal, &manifest()).await.unwrap();
+    let first = store
+        .admit(&principal, &request("artifact-owner"))
+        .await
+        .unwrap();
+    let second = store
+        .admit(&principal, &request("other-owner"))
+        .await
+        .unwrap();
+    let owner = first["run_id"].as_str().unwrap();
+    let other = second["run_id"].as_str().unwrap();
+    assert_eq!(
+        store.claim_preparation("prep", 60, 2).await.unwrap().len(),
+        2
+    );
+
+    let owned = reference(owner, None);
+    let artifact = owned["artifact_id"].as_str().unwrap();
+    let mut alternate = owned.clone();
+    alternate["artifact_id"] = json!("alternate");
+    let mut reused_id = reference(other, None);
+    reused_id["artifact_id"] = json!(artifact);
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    tx.execute(
+        "INSERT INTO dq_artifacts (artifact_id,run_id,reference,installation_id,namespace,retained_until)
+         VALUES ($1,$2,$3,'dq-test','native','-infinity')",
+        &[&artifact, &owner, &owned],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let revision = "b".repeat(64);
+    for (run, reference, expected) in [
+        (owner, &owned, "artifact_identity_conflict"),
+        (owner, &alternate, "artifact_identity_conflict"),
+        (other, &owned, "forbidden_artifact_reference"),
+        (other, &reused_id, "artifact_identity_conflict"),
+    ] {
+        code(
+            store
+                .complete_preparation(run, "prep", &json!([reference]), &revision)
+                .await,
+            expected,
+        );
+        assert_eq!(
+            store.get_run(&principal, run).await.unwrap()["input_refs"],
+            json!([])
+        );
+    }
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    tx.execute(
+        "UPDATE dq_artifacts SET retained_until=NULL WHERE artifact_id=$1",
+        &[&artifact],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert!(store
+        .complete_preparation(owner, "prep", &json!([owned]), &revision)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
 async fn interrupted_retention_hides_and_retries_the_deleted_version() {
     use axum::{http::StatusCode, routing::delete, Router};
     use octopus::{config::ArchiveConfig, dq_runtime::DqArtifacts};
@@ -350,6 +422,18 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
     let run_id = run["run_id"].as_str().unwrap();
     let mut first = reference(run_id, None);
     let mut second = reference(run_id, None);
+    let mut invalid = reference("different-run", None);
+    let mut shared = reference(run_id, None);
+    let invalid_id = "artifact-0-invalid";
+    let shared_id = "artifact-0-shared";
+    invalid["artifact_id"] = json!(invalid_id);
+    shared["artifact_id"] = json!(shared_id);
+    shared["version_id"] = json!("version-shared");
+    let legacy = store
+        .admit(&principal, &request("legacy-shared-artifact"))
+        .await
+        .unwrap();
+    let legacy_run = legacy["run_id"].as_str().unwrap();
     let artifact = "artifact-first";
     let other = "artifact-second";
     first["artifact_id"] = json!(artifact);
@@ -359,14 +443,31 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
     tx.execute(
         "UPDATE dq_runs SET status='succeeded', completed_at=CURRENT_TIMESTAMP - INTERVAL '91 days',
              input_refs=$2 WHERE run_id=$1",
-        &[&run_id, &json!([first, second])],
+        &[&run_id, &json!([first, second, invalid, shared])],
     )
     .await
     .unwrap();
     tx.execute(
         "INSERT INTO dq_artifacts (artifact_id,run_id,reference,installation_id,namespace)
-         VALUES ($1,$2,$3,'dq-test','native'), ($4,$2,$5,'dq-test','native')",
-        &[&artifact, &run_id, &first, &other, &second],
+         VALUES ($1,$2,$3,'dq-test','native'), ($4,$2,$5,'dq-test','native'),
+                ($6,$2,$7,'dq-test','native'), ($8,$2,$9,'dq-test','native')",
+        &[
+            &artifact,
+            &run_id,
+            &first,
+            &other,
+            &second,
+            &invalid_id,
+            &invalid,
+            &shared_id,
+            &shared,
+        ],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE dq_runs SET input_refs=$2 WHERE run_id=$1",
+        &[&legacy_run, &json!([shared])],
     )
     .await
     .unwrap();
@@ -418,11 +519,19 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
     );
     assert_eq!(
         store.get_run(&principal, run_id).await.unwrap()["input_refs"],
-        json!([second])
+        json!([second, shared])
     );
     assert_eq!(
         store.artifact(&principal, other, false).await.unwrap(),
         second
+    );
+    assert_eq!(
+        store.artifact(&principal, shared_id, false).await.unwrap(),
+        shared
+    );
+    assert_eq!(
+        store.get_run(&principal, legacy_run).await.unwrap()["input_refs"],
+        json!([shared])
     );
     // A later reopening can still retain the unclaimed artifact.
     let mut tx = fixture.runtime.begin_worker().await.unwrap();
@@ -453,6 +562,13 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
         .await
         .unwrap()
         .is_empty());
+    let invalid_claim: bool = tx
+        .query("SELECT retained_until = '-infinity'::timestamptz FROM dq_artifacts WHERE artifact_id=$1",
+               &[&invalid_id])
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert!(invalid_claim);
     tx.commit().await.unwrap();
     assert_eq!(
         store.artifact(&principal, other, false).await.unwrap(),

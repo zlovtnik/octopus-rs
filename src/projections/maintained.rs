@@ -31,23 +31,32 @@ impl ProjectionStore {
     }
     pub async fn project_wireless_inventory(&self, limit: i32) -> Result<i32, ProjectionError> {
         let mut tx = self.runtime.begin_worker().await?;
-        tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", &[]).await?;
-        let mut total = 0;
-        // Selection, additive client counts and marking share a serialization
-        // point so competing instances cannot count one input twice.
-        tx.query("SELECT pg_advisory_xact_lock(hashtextextended('octopus-inventory-projection',0)) IS NULL",&[]).await?;
-        for statement in [
-            inventory_sql::UPSERT_OBSERVED_DEVICES,
-            inventory_sql::UPSERT_WIRELESS_CLIENTS,
-            inventory_sql::UPSERT_SEARCH_DEVICES,
-        ] {
-            total += tx.execute(statement, &[&limit.max(1)]).await? as i32;
-        }
-        tx.execute(
-            inventory_sql::MARK_INVENTORY_INPUTS_PROJECTED,
-            &[&limit.max(1)],
+        // Serialize inventory writers through commit. The marker also claims the
+        // exact inputs before either upsert and rolls back with their writes.
+        tx.query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('octopus-inventory-projection',0)) IS NULL",
+            &[],
         )
         .await?;
+        let limit = limit.max(1);
+        let claimed: Vec<String> = tx
+            .query(inventory_sql::CLAIM_INVENTORY_INPUTS, &[&limit])
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let mut total = 0;
+        if !claimed.is_empty() {
+            for statement in [
+                inventory_sql::UPSERT_OBSERVED_DEVICES,
+                inventory_sql::UPSERT_WIRELESS_CLIENTS,
+            ] {
+                total += tx.execute(statement, &[&claimed]).await? as i32;
+            }
+        }
+        total += tx
+            .execute(inventory_sql::UPSERT_SEARCH_DEVICES, &[&limit, &claimed])
+            .await? as i32;
         tx.commit().await?;
         Ok(total)
     }
@@ -154,6 +163,9 @@ impl ProjectionStore {
             .await? as i32;
         total += tx
             .execute(graph_sql::DELETE_STALE_IDENTITY_MEMBER_EDGES, &[])
+            .await? as i32;
+        total += tx
+            .execute(graph_sql::DELETE_STALE_OBSERVATION_EDGES, &[])
             .await? as i32;
         total += tx
             .execute(graph_sql::DELETE_STALE_IDENTITY_CLUSTER_NODES, &[])

@@ -25,9 +25,9 @@ pub const SELECT_SIMILARITY_EDGES: &str = r#"SELECT left_source_mac, right_sourc
              )
              AND NOT EXISTS (
                SELECT 1 FROM atheros_search.merge_candidates candidate
-               WHERE candidate.mac_a = LEAST(pair.left_source_mac, pair.right_source_mac)
-                 AND candidate.mac_b = GREATEST(pair.left_source_mac, pair.right_source_mac)
-                 AND candidate.confidence >= pair.cosine_similarity
+               WHERE candidate.confidence >= pair.cosine_similarity
+                 AND ((candidate.mac_a = pair.left_source_mac AND candidate.mac_b = pair.right_source_mac)
+                   OR (candidate.mac_a = pair.right_source_mac AND candidate.mac_b = pair.left_source_mac))
              )
            ORDER BY pair.computed_at, pair.pair_id
            LIMIT $2::int"#;
@@ -75,9 +75,9 @@ pub const UPSERT_MERGE_CANDIDATE: &str = r#"WITH refreshed_reverse AS (
                expires_at = CURRENT_TIMESTAMP + INTERVAL '30 days',
                projection_run_id = $5,
                updated_at = CURRENT_TIMESTAMP
-             WHERE candidate_id = $1 AND mac_a = $3 AND mac_b = $2
+             WHERE mac_a = $3 AND mac_b = $2
              RETURNING candidate_id
-           )
+           ), inserted AS (
            INSERT INTO atheros_search.merge_candidates (
              candidate_id, mac_a, mac_b, confidence, computed_at, status,
              evidence, expires_at, projection_run_id
@@ -92,7 +92,11 @@ pub const UPSERT_MERGE_CANDIDATE: &str = r#"WITH refreshed_reverse AS (
              computed_at = EXCLUDED.computed_at,
              expires_at = EXCLUDED.expires_at,
              projection_run_id = EXCLUDED.projection_run_id,
-             updated_at = CURRENT_TIMESTAMP"#;
+             updated_at = CURRENT_TIMESTAMP
+           RETURNING candidate_id
+           )
+           SELECT candidate_id FROM refreshed_reverse
+           UNION ALL SELECT candidate_id FROM inserted"#;
 
 // Parameters: 1=limit.max(1)
 pub const RESOLVE_STALE_DNS_THREATS: &str = r#"WITH stale AS (

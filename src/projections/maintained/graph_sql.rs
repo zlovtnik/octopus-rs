@@ -48,6 +48,15 @@ pub(super) const DELETE_STALE_IDENTITY_MEMBER_EDGES: &str = r#"DELETE FROM ather
                                                )
                                              )"#;
 
+pub(super) const DELETE_STALE_OBSERVATION_EDGES: &str = r#"DELETE FROM atheros_search.graph_edges edge
+                              WHERE edge.edge_kind = 'observed_at'
+                                AND NOT EXISTS (
+                                  SELECT 1 FROM wireless_frames frame
+                                  WHERE frame.source_mac = substr(edge.source_node_id, 8)
+                                    AND frame.bssid = substr(edge.target_node_id, 4)
+                                    AND edge.edge_id = CONCAT('observed:', frame.source_mac, ':', frame.bssid)
+                                )"#;
+
 // Parameters:
 pub(super) const DELETE_STALE_IDENTITY_CLUSTER_NODES: &str = r#"DELETE FROM atheros_search.graph_nodes node
                                      WHERE node.node_kind = 'identity_cluster'
@@ -84,7 +93,10 @@ pub(super) const UPSERT_DEVICE_NODES: &str = r#"INSERT INTO atheros_search.graph
                           ) payload
                           ORDER BY (existing.node_id IS NULL) DESC,
                                    (existing.label IS DISTINCT FROM device.display_name
-                                    OR existing.node_payload IS DISTINCT FROM payload.value) DESC,
+                                    OR existing.node_payload IS DISTINCT FROM payload.value
+                                    OR (device.last_seen IS NOT NULL AND
+                                        (existing.observed_at IS NULL OR device.last_seen > existing.observed_at))) DESC,
+                                   existing.updated_at ASC,
                                    device.last_seen DESC, device.mac_id
                           LIMIT $2::int
                     ON CONFLICT (node_id) DO UPDATE SET
@@ -146,9 +158,16 @@ pub(super) const UPSERT_ACCESS_POINT_NODES: &str = r#"INSERT INTO atheros_search
                       ORDER BY (existing.node_id IS NULL) DESC,
                                (existing.is_threat IS DISTINCT FROM payload.is_threat
                                 OR existing.node_payload IS DISTINCT FROM payload.value
+                                OR (MAX(frame.location_id) IS NOT NULL
+                                    AND existing.location_id IS DISTINCT FROM MAX(frame.location_id))
+                                OR (MAX(frame.sensor_id) IS NOT NULL
+                                    AND existing.sensor_id IS DISTINCT FROM MAX(frame.sensor_id))
+                                OR (MAX(frame.observed_at) IS NOT NULL AND
+                                    (existing.observed_at IS NULL OR MAX(frame.observed_at) > existing.observed_at))
                                 OR (MAX(frame.ssid) IS NOT NULL
                                     AND (existing.label IS DISTINCT FROM MAX(frame.ssid)
                                          OR existing.normalized_ssid IS DISTINCT FROM MAX(frame.ssid)))) DESC,
+                               existing.updated_at ASC,
                                MAX(frame.observed_at) DESC, frame.bssid
                       LIMIT $2::int
                     ON CONFLICT (node_id) DO UPDATE SET
@@ -256,7 +275,8 @@ pub(super) const UPSERT_IDENTITY_MEMBER_EDGES: &str = r#"INSERT INTO atheros_sea
                              ORDER BY (existing.edge_id IS NULL
                                        OR existing.weight IS DISTINCT FROM member.confidence
                                        OR existing.evidence IS DISTINCT FROM member.evidence
-                                       OR member.last_seen > existing.observed_at) DESC NULLS LAST,
+                                       OR (member.last_seen IS NOT NULL AND
+                                           (existing.observed_at IS NULL OR member.last_seen > existing.observed_at))) DESC,
                                       member.last_seen DESC, member.cluster_id, member.mac
                              LIMIT $2::int
                              ON CONFLICT (edge_id) DO UPDATE SET
@@ -338,8 +358,34 @@ pub(super) const UPSERT_SAME_DEVICE_EDGES: &str = r#"INSERT INTO atheros_search.
                                   projection_run_id = EXCLUDED.projection_run_id,
                                   updated_at = CURRENT_TIMESTAMP"#;
 
+// Aggregate exact observation points before pairing devices. Merged overlap windows
+// preserve the inclusive ten-minute boundary and gaps without a frame-pair explosion.
 // Parameters: 1=projectionRunId, 2=batchLimit
-pub(super) const UPSERT_ROAMING_EDGES: &str = r#"INSERT INTO atheros_search.graph_edges (
+pub(super) const UPSERT_ROAMING_EDGES: &str = r#"WITH observations AS MATERIALIZED (
+                                SELECT frame.source_mac, frame.bssid,
+                                       range_agg(tstzrange(frame.observed_at, frame.observed_at, '[]')) AS observed_times,
+                                       range_agg(tstzrange(frame.observed_at - INTERVAL '10 minutes',
+                                                          frame.observed_at + INTERVAL '10 minutes', '[]')) AS overlap_windows
+                                FROM wireless_frames frame
+                                WHERE frame.source_mac IS NOT NULL AND frame.bssid IS NOT NULL
+                                  AND EXISTS (
+                                    SELECT 1 FROM atheros_search.graph_nodes node
+                                    WHERE node.node_id = CONCAT('device:', frame.source_mac)
+                                  )
+                                GROUP BY frame.source_mac, frame.bssid
+                              ), matches AS MATERIALIZED (
+                                SELECT left_observation.source_mac AS left_mac,
+                                       right_observation.source_mac AS right_mac,
+                                       left_observation.bssid AS shared_key,
+                                       GREATEST(upper(left_observation.observed_times * right_observation.overlap_windows),
+                                                upper(right_observation.observed_times * left_observation.overlap_windows)) AS last_observed
+                              FROM observations left_observation
+                              JOIN observations right_observation
+                                ON right_observation.source_mac > left_observation.source_mac
+                               AND left_observation.observed_times && right_observation.overlap_windows
+                               AND right_observation.bssid = left_observation.bssid
+                              )
+                              INSERT INTO atheros_search.graph_edges (
                               edge_id, source_node_id, target_node_id, edge_kind,
                               weight, weight_basis, label, evidence, observed_at, projection_run_id
                             )
@@ -351,33 +397,15 @@ pub(super) const UPSERT_ROAMING_EDGES: &str = r#"INSERT INTO atheros_search.grap
                                    jsonb_build_object('shared_bssids', pair.shared_aps, 'bssids', pair.bssid_list),
                                    pair.last_observed, $1
                             FROM (
-                              SELECT LEAST(left_frame.source_mac, right_frame.source_mac) AS left_mac,
-                                     GREATEST(left_frame.source_mac, right_frame.source_mac) AS right_mac,
-                                     COUNT(DISTINCT left_frame.bssid) AS shared_aps,
-                                     string_agg(DISTINCT left_frame.bssid, ',' ORDER BY left_frame.bssid) AS bssid_list,
-                                     MAX(left_frame.observed_at) AS last_observed
-                              FROM wireless_frames left_frame
-                              JOIN wireless_frames right_frame
-                                ON right_frame.bssid = left_frame.bssid
-                               AND right_frame.source_mac IS NOT NULL
-                               AND right_frame.source_mac <> left_frame.source_mac
-                               AND right_frame.observed_at >= left_frame.observed_at - INTERVAL '10 minutes'
-                               AND right_frame.observed_at <= left_frame.observed_at + INTERVAL '10 minutes'
-                              WHERE left_frame.source_mac IS NOT NULL
-                                AND left_frame.bssid IS NOT NULL
-                              GROUP BY LEAST(left_frame.source_mac, right_frame.source_mac),
-                                       GREATEST(left_frame.source_mac, right_frame.source_mac)
+                                  SELECT left_mac, right_mac,
+                                         COUNT(DISTINCT shared_key) AS shared_aps,
+                                         string_agg(DISTINCT shared_key, ',' ORDER BY shared_key) AS bssid_list,
+                                         MAX(last_observed) AS last_observed
+                                  FROM matches
+                                  GROUP BY left_mac, right_mac
                             ) pair
                             LEFT JOIN atheros_search.graph_edges existing
                               ON existing.edge_id = CONCAT('roaming:', pair.left_mac, ':', pair.right_mac)
-                            WHERE EXISTS (
-                              SELECT 1 FROM atheros_search.graph_nodes left_node
-                              WHERE left_node.node_id = CONCAT('device:', pair.left_mac)
-                            )
-                              AND EXISTS (
-                              SELECT 1 FROM atheros_search.graph_nodes right_node
-                              WHERE right_node.node_id = CONCAT('device:', pair.right_mac)
-                            )
                             ORDER BY (existing.edge_id IS NULL
                                       OR existing.weight IS DISTINCT FROM pair.shared_aps::double precision
                                       OR existing.evidence IS DISTINCT FROM jsonb_build_object(
@@ -397,7 +425,39 @@ pub(super) const UPSERT_ROAMING_EDGES: &str = r#"INSERT INTO atheros_search.grap
                               updated_at = CURRENT_TIMESTAMP"#;
 
 // Parameters: 1=projectionRunId, 2=batchLimit
-pub(super) const UPSERT_SAME_CHANNEL_EDGES: &str = r#"INSERT INTO atheros_search.graph_edges (
+pub(super) const UPSERT_SAME_CHANNEL_EDGES: &str = r#"WITH observations AS MATERIALIZED (
+                                SELECT frame.source_mac, radio.channel_number, radio.frequency_mhz,
+                                       range_agg(tstzrange(frame.observed_at, frame.observed_at, '[]')) AS observed_times,
+                                       range_agg(tstzrange(frame.observed_at - INTERVAL '10 minutes',
+                                                          frame.observed_at + INTERVAL '10 minutes', '[]')) AS overlap_windows
+                                FROM wireless_frames frame
+                                     JOIN wireless_frame_radio radio USING (dedupe_key)
+                                WHERE frame.source_mac IS NOT NULL
+                                  AND (radio.channel_number IS NOT NULL OR radio.frequency_mhz IS NOT NULL)
+                                  AND EXISTS (
+                                    SELECT 1 FROM atheros_search.graph_nodes node
+                                    WHERE node.node_id = CONCAT('device:', frame.source_mac)
+                                  )
+                                GROUP BY frame.source_mac, radio.channel_number, radio.frequency_mhz
+                              ), matches AS MATERIALIZED (
+                                SELECT left_observation.source_mac AS left_mac,
+                                       right_observation.source_mac AS right_mac,
+                                       COALESCE(left_observation.frequency_mhz::text || ' MHz',
+                                              right_observation.frequency_mhz::text || ' MHz',
+                                              'channel ' || left_observation.channel_number::text) AS shared_key,
+                                       GREATEST(upper(left_observation.observed_times * right_observation.overlap_windows),
+                                                upper(right_observation.observed_times * left_observation.overlap_windows)) AS last_observed
+                              FROM observations left_observation
+                              JOIN observations right_observation
+                                ON right_observation.source_mac > left_observation.source_mac
+                               AND left_observation.observed_times && right_observation.overlap_windows
+                               AND ((left_observation.frequency_mhz IS NOT NULL
+                                     AND right_observation.frequency_mhz IS NOT NULL
+                                     AND left_observation.frequency_mhz = right_observation.frequency_mhz)
+                                 OR ((left_observation.frequency_mhz IS NULL OR right_observation.frequency_mhz IS NULL)
+                                     AND left_observation.channel_number = right_observation.channel_number))
+                              )
+                              INSERT INTO atheros_search.graph_edges (
                                   edge_id, source_node_id, target_node_id, edge_kind,
                                   weight, weight_basis, label, evidence, observed_at, projection_run_id
                                 )
@@ -409,38 +469,15 @@ pub(super) const UPSERT_SAME_CHANNEL_EDGES: &str = r#"INSERT INTO atheros_search
                                        jsonb_build_object('channels', pair.channel_list),
                                        pair.last_observed, $1
                                 FROM (
-                                  SELECT LEAST(left_frame.source_mac, right_frame.source_mac) AS left_mac,
-                                         GREATEST(left_frame.source_mac, right_frame.source_mac) AS right_mac,
-                                          COUNT(DISTINCT radio.channel_number) AS shared_channels,
-                                          string_agg(DISTINCT radio.channel_number::text, ',' ORDER BY radio.channel_number::text) AS channel_list,
-                                          MAX(left_frame.observed_at) AS last_observed
-                                   FROM wireless_frames left_frame
-                                   JOIN wireless_frames right_frame
-                                     ON right_frame.source_mac IS NOT NULL
-                                    AND right_frame.source_mac <> left_frame.source_mac
-                                    AND right_frame.observed_at >= left_frame.observed_at - INTERVAL '10 minutes'
-                                    AND right_frame.observed_at <= left_frame.observed_at + INTERVAL '10 minutes'
-                                   JOIN wireless_frame_radio radio
-                                     ON radio.dedupe_key = left_frame.dedupe_key
-                                    AND radio.channel_number IS NOT NULL
-                                   JOIN wireless_frame_radio right_radio
-                                     ON right_radio.dedupe_key = right_frame.dedupe_key
-                                    AND right_radio.channel_number = radio.channel_number
-                                  WHERE left_frame.source_mac IS NOT NULL
-                                  GROUP BY LEAST(left_frame.source_mac, right_frame.source_mac),
-                                           GREATEST(left_frame.source_mac, right_frame.source_mac)
+                                  SELECT left_mac, right_mac,
+                                         COUNT(DISTINCT shared_key) AS shared_channels,
+                                         string_agg(DISTINCT shared_key, ',' ORDER BY shared_key) AS channel_list,
+                                         MAX(last_observed) AS last_observed
+                                  FROM matches
+                                  GROUP BY left_mac, right_mac
                                 ) pair
                                 LEFT JOIN atheros_search.graph_edges existing
                                   ON existing.edge_id = CONCAT('same-channel:', pair.left_mac, ':', pair.right_mac)
-                                WHERE pair.shared_channels >= 1
-                                  AND EXISTS (
-                                    SELECT 1 FROM atheros_search.graph_nodes left_node
-                                    WHERE left_node.node_id = CONCAT('device:', pair.left_mac)
-                                  )
-                                  AND EXISTS (
-                                    SELECT 1 FROM atheros_search.graph_nodes right_node
-                                    WHERE right_node.node_id = CONCAT('device:', pair.right_mac)
-                                  )
                                 ORDER BY (existing.edge_id IS NULL
                                           OR existing.weight IS DISTINCT FROM pair.shared_channels::double precision
                                           OR existing.evidence IS DISTINCT FROM jsonb_build_object('channels', pair.channel_list)
@@ -653,49 +690,62 @@ pub(super) const DELETE_STALE_ACCESS_POINT_CATALOG: &str = r#"DELETE FROM athero
                               )"#;
 
 // Parameters:
-pub(super) const UPSERT_WIRELESS_EVIDENCE_WATERMARK: &str = r#"WITH source AS (
-                            SELECT MAX(observed_at) AS source_watermark_at
+pub(super) const UPSERT_WIRELESS_EVIDENCE_WATERMARK: &str = r#"WITH buckets AS (
+                            SELECT date_trunc('hour', observed_at)
+                                     + floor(EXTRACT(minute FROM observed_at) / 5) * INTERVAL '5 minutes'
+                                     AS window_start,
+                                   COALESCE(sensor_id, 'unknown') AS sensor_id, bssid, source_mac,
+                                   MAX(observed_at) AS last_observed_at,
+                                   COUNT(*) AS retained_count
                             FROM wireless_frames
                             WHERE source_mac IS NOT NULL AND bssid IS NOT NULL
                               AND source_mac <> bssid
                               AND source_mac NOT IN ('ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00')
                               AND bssid NOT IN ('ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00')
+                            GROUP BY 1, 2, 3, 4
                           ),
-                          projection AS (
-                            SELECT MAX(last_observed_at) AS projection_watermark_at,
-                                   MAX(projected_at) AS last_projected_at
-                            FROM atheros_search.wireless_signal_summaries
+                          coverage AS (
+                            SELECT MAX(bucket.last_observed_at) AS source_watermark_at,
+                                   MAX(summary.last_observed_at) AS projection_watermark_at,
+                                   MAX(summary.projected_at) AS last_projected_at,
+                                   COUNT(*) FILTER (WHERE summary.frame_count IS DISTINCT FROM bucket.retained_count) AS missing_buckets
+                            FROM buckets bucket
+                            LEFT JOIN atheros_search.wireless_signal_summaries summary
+                              USING (window_start, sensor_id, bssid, source_mac)
                           )
                           INSERT INTO atheros_search.investigation_watermarks (
                             projection_name, source_watermark_at, projection_watermark_at,
                             coverage_status, coverage_reason, updated_at
                           )
                           SELECT 'wireless_evidence',
-                                 source.source_watermark_at,
-                                 projection.projection_watermark_at,
+                                 coverage.source_watermark_at,
+                                 coverage.projection_watermark_at,
                                  CASE
-                                   WHEN source.source_watermark_at IS NULL THEN 'unknown'
-                                   WHEN projection.projection_watermark_at IS NULL THEN 'stalled'
-                                   WHEN source.source_watermark_at - projection.projection_watermark_at
+                                   WHEN coverage.source_watermark_at IS NULL THEN 'unknown'
+                                   WHEN coverage.projection_watermark_at IS NULL THEN 'stalled'
+                                   WHEN coverage.missing_buckets > 0
+                                     OR coverage.source_watermark_at - coverage.projection_watermark_at
                                           > INTERVAL '15 minutes' THEN
-                                     CASE WHEN projection.last_projected_at
+                                     CASE WHEN coverage.last_projected_at
                                                < CURRENT_TIMESTAMP - INTERVAL '6 hours'
                                           THEN 'stalled' ELSE 'partial' END
                                    ELSE 'complete'
                                  END,
                                  CASE
-                                   WHEN source.source_watermark_at IS NULL
+                                   WHEN coverage.source_watermark_at IS NULL
                                      THEN 'no eligible retained wireless frames'
-                                   WHEN projection.projection_watermark_at IS NULL
+                                   WHEN coverage.projection_watermark_at IS NULL
                                      THEN 'no five-minute signal summaries have been projected'
-                                   WHEN source.source_watermark_at - projection.projection_watermark_at
+                                   WHEN coverage.missing_buckets > 0
+                                     THEN format('%s retained five-minute signal buckets have missing or mismatched summaries', coverage.missing_buckets)
+                                   WHEN coverage.source_watermark_at - coverage.projection_watermark_at
                                           > INTERVAL '15 minutes' THEN
                                      'signal summaries lag the retained source watermark; '
                                        || 'the projection recomputes buckets written within the last seven days'
                                    ELSE NULL
                                  END,
                                  CURRENT_TIMESTAMP
-                          FROM source, projection
+                          FROM coverage
                           ON CONFLICT (projection_name) DO UPDATE SET
                             source_watermark_at = EXCLUDED.source_watermark_at,
                             projection_watermark_at = EXCLUDED.projection_watermark_at,
@@ -712,7 +762,47 @@ pub(super) const DELETE_ORPHANED_EDGES: &str = r#"DELETE FROM atheros_search.gra
                                        OR NOT EXISTS (
                                        SELECT 1 FROM atheros_search.graph_nodes target_node
                                        WHERE target_node.node_id = edge.target_node_id
-                                     )"#;
+                                     )
+                                       OR (edge.edge_kind = 'roaming' AND NOT EXISTS (
+                                         SELECT 1 FROM wireless_frames left_frame
+                                         WHERE left_frame.source_mac = substr(edge.source_node_id, 8)
+                                           AND left_frame.bssid IS NOT NULL
+                                           AND EXISTS (
+                                             SELECT 1 FROM wireless_frames right_frame
+                                             WHERE right_frame.source_mac = substr(edge.target_node_id, 8)
+                                               AND right_frame.bssid = left_frame.bssid
+                                               AND right_frame.observed_at BETWEEN left_frame.observed_at - INTERVAL '10 minutes'
+                                                                             AND left_frame.observed_at + INTERVAL '10 minutes'
+                                           )
+                                       ))
+                                       OR (edge.edge_kind = 'same_channel' AND NOT EXISTS (
+                                         SELECT 1 FROM wireless_frames left_frame
+                                         JOIN wireless_frame_radio radio USING (dedupe_key)
+                                         WHERE left_frame.source_mac = substr(edge.source_node_id, 8)
+                                           AND (radio.channel_number IS NOT NULL OR radio.frequency_mhz IS NOT NULL)
+                                           AND EXISTS (
+                                             SELECT 1 FROM wireless_frames right_frame
+                                             JOIN wireless_frame_radio right_radio USING (dedupe_key)
+                                             WHERE right_frame.source_mac = substr(edge.target_node_id, 8)
+                                               AND (right_radio.channel_number IS NOT NULL OR right_radio.frequency_mhz IS NOT NULL)
+                                               AND right_frame.observed_at BETWEEN left_frame.observed_at - INTERVAL '10 minutes'
+                                                                             AND left_frame.observed_at + INTERVAL '10 minutes'
+                                               AND ((radio.frequency_mhz IS NOT NULL AND right_radio.frequency_mhz IS NOT NULL
+                                                     AND radio.frequency_mhz = right_radio.frequency_mhz)
+                                                 OR ((radio.frequency_mhz IS NULL OR right_radio.frequency_mhz IS NULL)
+                                                     AND radio.channel_number = right_radio.channel_number))
+                                           )
+                                       ))
+                                       OR (edge.edge_kind = 'vendor_link' AND NOT EXISTS (
+                                         SELECT 1 FROM wireless_frames left_frame
+                                         WHERE left_frame.source_mac = substr(edge.source_node_id, 8)
+                                           AND left_frame.bssid_oui IS NOT NULL
+                                           AND EXISTS (
+                                             SELECT 1 FROM wireless_frames right_frame
+                                             WHERE right_frame.source_mac = substr(edge.target_node_id, 8)
+                                               AND right_frame.bssid_oui = left_frame.bssid_oui
+                                           )
+                                       ))"#;
 
 // Parameters:
 pub(super) const UPSERT_GRAPH_PROJECTION_WATERMARK: &str = r#"WITH retained_pairs AS MATERIALIZED (
@@ -745,6 +835,15 @@ pub(super) const UPSERT_GRAPH_PROJECTION_WATERMARK: &str = r#"WITH retained_pair
                                 WHERE pair.current
                                   AND (coverage.first_gap_at IS NULL OR pair.observed_at < coverage.first_gap_at)
                               ),
+                              stale_edges AS (
+                                SELECT COUNT(*) AS edge_count
+                                FROM atheros_search.graph_edges edge
+                                WHERE edge.edge_kind = 'observed_at'
+                                  AND NOT EXISTS (
+                                    SELECT 1 FROM retained_pairs pair
+                                    WHERE edge.edge_id = CONCAT('observed:', pair.source_mac, ':', pair.bssid)
+                                  )
+                              ),
                               devices AS (
                                 SELECT COUNT(*) AS device_count
                                 FROM atheros_search.graph_nodes
@@ -760,16 +859,17 @@ pub(super) const UPSERT_GRAPH_PROJECTION_WATERMARK: &str = r#"WITH retained_pair
                                      CASE
                                        WHEN coverage.pair_count = 0 THEN 'unknown'
                                        WHEN coverage.current_count = 0 THEN 'stalled'
-                                       WHEN coverage.current_count < coverage.pair_count THEN 'partial'
+                                       WHEN coverage.current_count < coverage.pair_count OR stale_edges.edge_count > 0
+                                         THEN 'partial'
                                        ELSE 'complete'
                                      END,
                                      format(
-                                       '%s of %s distinct (source_mac,bssid) pairs current; %s device nodes vs %s frame source MACs',
+                                       '%s of %s distinct (source_mac,bssid) pairs current; %s device nodes vs %s frame source MACs; %s stale observed edges',
                                        coverage.current_count, coverage.pair_count,
-                                       devices.device_count, coverage.mac_count
+                                       devices.device_count, coverage.mac_count, stale_edges.edge_count
                                      ),
                                      CURRENT_TIMESTAMP
-                              FROM coverage, projection, devices
+                              FROM coverage, projection, devices, stale_edges
                               ON CONFLICT (projection_name) DO UPDATE SET
                                 source_watermark_at = EXCLUDED.source_watermark_at,
                                 projection_watermark_at = EXCLUDED.projection_watermark_at,

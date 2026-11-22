@@ -329,3 +329,133 @@ async fn durable_control_scope_fences_receipts_and_rollback() {
     );
     fixture.runtime.close();
 }
+
+#[tokio::test]
+async fn interrupted_retention_hides_and_retries_the_deleted_version() {
+    use axum::{http::StatusCode, routing::delete, Router};
+    use octopus::{config::ArchiveConfig, dq_runtime::DqArtifacts};
+    use std::{sync::Arc, time::Duration};
+
+    let Some(fixture) = support::Fixture::start().await else {
+        return;
+    };
+    let store = DqStore::new(fixture.runtime.clone(), settings());
+    store.reconcile_policies().await.unwrap();
+    let principal = actor();
+    store.register(&principal, &manifest()).await.unwrap();
+    let run = store
+        .admit(&principal, &request("retention"))
+        .await
+        .unwrap();
+    let run_id = run["run_id"].as_str().unwrap();
+    let mut first = reference(run_id, None);
+    let mut second = reference(run_id, None);
+    let artifact = "artifact-first";
+    let other = "artifact-second";
+    first["artifact_id"] = json!(artifact);
+    second["artifact_id"] = json!(other);
+    second["version_id"] = json!("version-2");
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    tx.execute(
+        "UPDATE dq_runs SET status='succeeded', completed_at=CURRENT_TIMESTAMP - INTERVAL '91 days',
+             input_refs=$2 WHERE run_id=$1",
+        &[&run_id, &json!([first, second])],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO dq_artifacts (artifact_id,run_id,reference,installation_id,namespace)
+         VALUES ($1,$2,$3,'dq-test','native'), ($4,$2,$5,'dq-test','native')",
+        &[&artifact, &run_id, &first, &other, &second],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        store.artifact(&principal, artifact, false).await.unwrap(),
+        first
+    );
+
+    let deleted = Arc::new(tokio::sync::Notify::new());
+    let on_delete = deleted.clone();
+    let app = Router::new().fallback_service(delete(move |uri: axum::http::Uri| {
+        let deleted = on_delete.clone();
+        async move {
+            assert_eq!(uri.query(), Some("versionId=version-1"));
+            deleted.notify_one();
+            std::future::pending::<StatusCode>().await
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let config = DqConfig {
+        artifact_bucket: "dq-artifacts".into(),
+        ..config()
+    };
+    let storage = |addr| ArchiveConfig {
+        endpoint: format!("http://{addr}"),
+        access_key: "test-key".into(),
+        secret_key: "test-secret".into(),
+        ..ArchiveConfig::default()
+    };
+    let artifacts = DqArtifacts::new(config.clone(), &storage(addr)).unwrap();
+    let worker = {
+        let store = store.clone();
+        let config = config.clone();
+        tokio::spawn(async move { store.collect_retention(&artifacts, &config).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), deleted.notified())
+        .await
+        .unwrap();
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    server.abort();
+
+    code(
+        store.artifact(&principal, artifact, true).await,
+        "artifact_not_found",
+    );
+    assert_eq!(
+        store.get_run(&principal, run_id).await.unwrap()["input_refs"],
+        json!([second])
+    );
+    assert_eq!(
+        store.artifact(&principal, other, false).await.unwrap(),
+        second
+    );
+    // A later reopening can still retain the unclaimed artifact.
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    tx.execute(
+        "UPDATE dq_runs SET projection_applied=true WHERE run_id=$1",
+        &[&run_id],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let app = Router::new().fallback_service(delete(|uri: axum::http::Uri| async move {
+        assert_eq!(uri.query(), Some("versionId=version-1"));
+        StatusCode::NOT_FOUND
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let artifacts =
+        DqArtifacts::new(config.clone(), &storage(listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    store.collect_retention(&artifacts, &config).await.unwrap();
+    server.abort();
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    assert!(tx
+        .query(
+            "SELECT 1 FROM dq_artifacts WHERE artifact_id=$1",
+            &[&artifact]
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    tx.commit().await.unwrap();
+    assert_eq!(
+        store.artifact(&principal, other, false).await.unwrap(),
+        second
+    );
+}

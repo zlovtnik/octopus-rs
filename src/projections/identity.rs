@@ -26,12 +26,13 @@ pub async fn persist_merge_candidate(
     };
     let id = stable_id("merge-candidate", &[left, right]);
     let run = stable_id("merge-candidate-run", &[&id]);
-    tx.execute(
-        q::UPSERT_MERGE_CANDIDATE,
-        &[&id, &left, &right, &confidence.clamp(0.0, 1.0), &run],
-    )
-    .await?;
-    Ok(id)
+    let rows = tx
+        .query(
+            q::UPSERT_MERGE_CANDIDATE,
+            &[&id, &left, &right, &confidence.clamp(0.0, 1.0), &run],
+        )
+        .await?;
+    Ok(rows[0].get(0))
 }
 async fn reconcile(
     tx: &mut PgTransaction,

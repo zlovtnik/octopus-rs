@@ -769,10 +769,10 @@ mod tests {
             self.events.lock().unwrap().push(event);
         }
     }
-    impl BatchHandler<String> for Journal {
+    impl<A: Send + 'static> BatchHandler<A> for Journal {
         fn process(
             &self,
-            records: Vec<LockedRecord<String>>,
+            records: Vec<LockedRecord<A>>,
         ) -> BoxFuture<'_, Result<(), BoundaryError>> {
             Box::pin(async move {
                 self.record(format!(
@@ -939,6 +939,81 @@ mod tests {
         .await
         .is_err());
         assert_eq!(journal.events(), ["handle:[0]"]);
+    }
+
+    #[tokio::test]
+    async fn wireless_null_is_retried_and_parked_before_later_observations() {
+        let journal = Journal::default();
+        let cancel = CancellationToken::new();
+        let topic = "wireless.audit";
+        let records = [
+            record(0, Some("null")),
+            record(
+                1,
+                Some(r#"{"sensor_id":"sensor","observed_at":"2026-11-18T10:00:00Z"}"#),
+            ),
+        ]
+        .map(|record| BrokerRecord {
+            topic: topic.into(),
+            ..record
+        });
+        let decode = |raw: &str| {
+            crate::projections::decode_wireless(raw).map_err(|e| Poison::invalid(e.to_string()))
+        };
+        let consume = || {
+            process_batch(
+                records.to_vec(),
+                "wireless-audit-projection-v1",
+                topic,
+                1024,
+                &decode,
+                &journal,
+                &journal,
+                &cancel,
+            )
+        };
+        journal.fail_park.store(true, Ordering::SeqCst);
+        assert!(matches!(consume().await, Err(BoundaryError::Retryable(_))));
+        assert_eq!(journal.events(), ["park:0"]);
+        journal.fail_park.store(false, Ordering::SeqCst);
+        consume().await.unwrap();
+        assert_eq!(
+            journal.events(),
+            ["park:0", "park:0", "handle:[1]", "commit:0:2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn wireless_decode_parking_does_not_commit_past_projection_failure() {
+        let journal = Journal::default();
+        journal.fail_handle.store(true, Ordering::SeqCst);
+        let topic = "wireless.audit";
+        let records = [
+            record(
+                0,
+                Some(r#"{"sensor_id":"sensor","observed_at":"2026-11-18T10:00:00Z"}"#),
+            ),
+            record(1, Some(r#"{"sensor_id":"sensor","observed_at":"invalid"}"#)),
+        ]
+        .map(|record| BrokerRecord {
+            topic: topic.into(),
+            ..record
+        });
+        let result = process_batch(
+            records.to_vec(),
+            "wireless-audit-projection-v1",
+            topic,
+            1024,
+            &|raw| {
+                crate::projections::decode_wireless(raw).map_err(|e| Poison::invalid(e.to_string()))
+            },
+            &journal,
+            &journal,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(result, Err(BoundaryError::Retryable(_))));
+        assert_eq!(journal.events(), ["park:1", "handle:[0]"]);
     }
 
     #[tokio::test]

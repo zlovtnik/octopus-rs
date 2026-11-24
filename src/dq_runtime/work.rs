@@ -15,24 +15,56 @@ impl DqStore {
         tx.commit().await.map_err(database)?;
         Ok(values)
     }
-    async fn artifacts_tx(&self, tx: &mut PgTransaction, run: &str, refs: &Value) -> Result<()> {
+    async fn artifacts_tx(
+        &self,
+        tx: &mut PgTransaction,
+        run: &str,
+        refs: &Value,
+        input: bool,
+    ) -> Result<()> {
         for reference in refs.as_array().into_iter().flatten() {
             let artifact = dq::text(reference, "artifact_id")?;
             // Both callers lock the owning run. Validated object paths are
             // run-scoped, so that lock also serializes exact-version admission.
-            let alias_exists: bool = tx
+            let aliases = tx
                 .query(
-                    "SELECT EXISTS (
-                       SELECT 1 FROM octopus_core.dq_artifacts
-                       WHERE reference->>'uri' = $1 AND reference->>'version_id' = $2 AND artifact_id <> $3
-                     )",
+                    "SELECT artifact_id FROM octopus_core.dq_artifacts
+                     WHERE reference->>'uri' = $1 AND reference->>'version_id' = $2 AND artifact_id <> $3
+                     LIMIT 2",
                     &[&dq::text(reference, "uri")?, &dq::text(reference, "version_id")?, &artifact],
                 )
                 .await
-                .map_err(database)?[0]
-                .get(0);
-            if alias_exists {
-                return Err(error(409, "artifact_identity_conflict"));
+                .map_err(database)?;
+            match aliases.as_slice() {
+                [] => (),
+                [alias] if input => {
+                    // fail_work detaches inputs for re-preparation. Replace only an
+                    // unclaimed alias for the same object and metadata that no run uses.
+                    let old_id: String = alias.get(0);
+                    let removed = tx.execute(
+                        "DELETE FROM octopus_core.dq_artifacts a
+                         WHERE a.artifact_id = $1 AND a.run_id = $2
+                           AND a.installation_id = $4 AND a.namespace = $5
+                           AND a.closed_at IS NULL AND a.retained_until IS NULL
+                           AND a.reference - 'artifact_id' = $3::jsonb - 'artifact_id'
+                           AND NOT EXISTS (
+                             SELECT 1 FROM octopus_core.dq_runs r
+                             CROSS JOIN LATERAL (VALUES
+                               (TRUE, jsonb_build_array(jsonb_build_object('artifact_id', a.artifact_id))),
+                               (FALSE, jsonb_build_array(jsonb_build_object('uri', a.reference->>'uri',
+                                                                           'version_id', a.reference->>'version_id')))
+                             ) AS identity(by_id, ref)
+                             WHERE r.installation_id = a.installation_id AND r.namespace = a.namespace
+                               AND (identity.by_id OR r.run_id <> a.run_id)
+                               AND (r.input_refs @> identity.ref OR r.output_refs @> identity.ref)
+                           )",
+                        &[&old_id, &run, &reference, &self.settings.installation_id, &self.settings.namespace],
+                    ).await.map_err(database)?;
+                    if removed != 1 {
+                        return Err(error(409, "artifact_identity_conflict"));
+                    }
+                }
+                _ => return Err(error(409, "artifact_identity_conflict")),
             }
             let accepted = tx
                 .execute(
@@ -74,7 +106,7 @@ impl DqStore {
             0
         };
         if changed == 1 {
-            self.artifacts_tx(&mut tx, run, refs).await?;
+            self.artifacts_tx(&mut tx, run, refs, true).await?;
             self.event(&mut tx, run, "invoke", "dq.commands.v1").await?;
         }
         tx.commit().await.map_err(database)?;
@@ -374,7 +406,7 @@ impl DqStore {
             if usize::try_from(dq::long(&refs[0], "size_bytes")?).map_or(true, |size| size > output_limit) {
                 return Err(error(400, "artifact_size_exceeded"));
             }
-            self.artifacts_tx(tx, run, refs).await?;
+            self.artifacts_tx(tx, run, refs, false).await?;
             tx.execute("UPDATE octopus_core.dq_runs SET status='applying',output_refs=$2,state_revision=state_revision+1 WHERE run_id=$1 AND status='running'",&[&run,&refs]).await.map_err(database)?;
             tx.execute("UPDATE octopus_core.dq_attempts SET status='applying',report_sequence=$2 WHERE attempt_id=$1",&[&attempt,&sequence]).await.map_err(database)?;
         } else if kind == "attempt_failed" {

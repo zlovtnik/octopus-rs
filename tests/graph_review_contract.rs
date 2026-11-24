@@ -1,6 +1,7 @@
 mod support;
 
 use octopus::projections::{identity::persist_merge_candidate, ProjectionStore};
+use std::time::Duration;
 use support::Fixture;
 
 async fn assert_query(fixture: &Fixture, sql: &str) {
@@ -9,6 +10,30 @@ async fn assert_query(fixture: &Fixture, sql: &str) {
     assert_eq!(rows.len(), 1, "{sql}");
     assert_eq!(rows[0].get::<_, Option<bool>>(0), Some(true), "{sql}");
     tx.commit().await.unwrap();
+}
+
+async fn wait_for_blocked_backend(fixture: &Fixture, blocker: i32) -> i32 {
+    let mut observer = fixture.runtime.begin_worker().await.unwrap();
+    let pid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = observer
+                .query(
+                    "SELECT pid FROM pg_locks WHERE NOT granted
+                       AND $1 = ANY(pg_blocking_pids(pid))",
+                    &[&blocker],
+                )
+                .await
+                .unwrap();
+            if let Some(row) = rows.first() {
+                return row.get(0);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("projection did not reach the expected lock");
+    observer.commit().await.unwrap();
+    pid
 }
 
 #[tokio::test]
@@ -185,7 +210,10 @@ async fn candidate_edges_prioritize_changes_and_share_confirmation_threshold() {
          DELETE FROM atheros_search.graph_edges WHERE source_node_id = 'device:06:00:00:00:00:01'
            AND edge_kind IN ('roaming','same_channel','vendor_link')",
     );
-    store.project_infrastructure_graph(1).await.unwrap();
+    // Three qualifying pairs fit into three one-pair pages.
+    for _ in 0..3 {
+        store.project_infrastructure_graph(1).await.unwrap();
+    }
     assert_query(
         &fixture,
         "SELECT count(*) = 3 AND bool_and(weight = 1 AND observed_at = '2026-09-20 12:03:00+00')
@@ -193,12 +221,151 @@ async fn candidate_edges_prioritize_changes_and_share_confirmation_threshold() {
         AND edge_kind IN ('roaming','same_channel','vendor_link')",
     )
     .await;
-    store.project_infrastructure_graph(1).await.unwrap();
     assert_query(&fixture, "SELECT count(*) = 3 FROM atheros_search.graph_edges
         WHERE source_node_id = 'device:06:00:00:00:00:01' AND edge_kind IN ('roaming','same_channel','vendor_link')").await;
     assert_query(
         &fixture,
         "SELECT count(*) = 1 FROM atheros_search.graph_edges WHERE edge_kind = 'same_device'",
+    )
+    .await;
+
+    // Hold the graph after the same-device upsert and before final cleanup.
+    let mut blocker = fixture.runtime.begin_worker().await.unwrap();
+    let blocker_pid = blocker
+        .query(
+            "SELECT pg_backend_pid(), pg_advisory_xact_lock(hashtextextended('octopus-wireless-radio',0)) IS NULL",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let graph_run = {
+        let store = store.clone();
+        tokio::spawn(async move { store.project_infrastructure_graph(20).await })
+    };
+    wait_for_blocked_backend(&fixture, blocker_pid).await;
+    fixture.admin(
+        "INSERT INTO atheros_search.merge_candidates
+           (candidate_id, mac_a, mac_b, status, projection_run_id)
+         VALUES ('reverse', '04:00:00:00:00:02', '04:00:00:00:00:01', 'not_match', 'fixture');
+         INSERT INTO atheros_search.merge_decisions (candidate_id, decision)
+         VALUES ('reverse', 'not_match')",
+    );
+    blocker.commit().await.unwrap();
+    graph_run.await.unwrap().unwrap();
+    assert_query(
+        &fixture,
+        "SELECT count(*) = 0 FROM atheros_search.graph_edges WHERE edge_kind = 'same_device'",
+    )
+    .await;
+    assert!(store.project_approved_identities(1).await.unwrap() > 0);
+    assert_query(
+        &fixture,
+        "SELECT count(*) = 0 FROM atheros_search.identity_cluster_members member
+         JOIN atheros_search.identity_clusters cluster USING (cluster_id)
+         WHERE cluster.status = 'active'
+           AND member.mac IN ('04:00:00:00:00:01', '04:00:00:00:00:02')",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cluster_refresh_cleans_referencing_edges_and_prioritizes_null_observation_times() {
+    let Some(fixture) = Fixture::start().await else {
+        return;
+    };
+    let store = ProjectionStore::new(fixture.runtime.clone());
+    fixture.admin(
+        "INSERT INTO atheros_search.identity_clusters
+           (cluster_id, cluster_name, last_seen, projection_run_id)
+         VALUES ('current','current','2020-01-01','fixture'),
+                ('missing','missing','2020-01-01','fixture'),
+                ('obsolete','obsolete','2020-01-01','fixture')",
+    );
+    store.project_infrastructure_graph(10).await.unwrap();
+    fixture.admin(
+        "ALTER TABLE atheros_search.graph_edges
+           ADD FOREIGN KEY (source_node_id) REFERENCES atheros_search.graph_nodes,
+           ADD FOREIGN KEY (target_node_id) REFERENCES atheros_search.graph_nodes;
+         INSERT INTO atheros_search.graph_edges
+           (edge_id, source_node_id, target_node_id, edge_kind, projection_run_id)
+         VALUES ('legacy','identity:current','identity:obsolete','legacy_link','fixture');
+         UPDATE atheros_search.identity_clusters SET status='inactive' WHERE cluster_id='obsolete';
+         UPDATE atheros_search.graph_nodes SET observed_at = NULL WHERE node_id='identity:missing';
+         UPDATE atheros_search.graph_nodes SET updated_at = '2020-01-01' WHERE node_id='identity:current'",
+    );
+    store.project_infrastructure_graph(1).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT NOT EXISTS (SELECT 1 FROM atheros_search.graph_edges WHERE edge_id='legacy')
+            AND NOT EXISTS (SELECT 1 FROM atheros_search.graph_nodes WHERE node_id='identity:obsolete')
+            AND (SELECT observed_at='2020-01-01' FROM atheros_search.graph_nodes
+                 WHERE node_id='identity:missing')
+            AND (SELECT updated_at='2020-01-01' FROM atheros_search.graph_nodes
+                 WHERE node_id='identity:current')",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn roaming_scan_advances_through_a_sparse_page_and_wraps_to_earlier_pairs() {
+    let Some(fixture) = Fixture::start().await else {
+        return;
+    };
+    let store = ProjectionStore::new(fixture.runtime.clone());
+    fixture.admin(
+        "INSERT INTO octopus_core.devices(mac_id,mac_hint)
+         SELECT mac,mac FROM (
+           SELECT '02:00:00:00:00:' || lpad(to_hex(n),2,'0') AS mac
+           FROM generate_series(1,13) n
+         ) devices",
+    );
+    store.project_infrastructure_graph(20).await.unwrap();
+    fixture.admin(
+        "INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,bssid,observed_at)
+         SELECT n::text, '02:00:00:00:00:' || lpad(to_hex(n),2,'0'),
+                '12:00:00:00:00:01',
+                '2026-09-20 13:00:00+00'::timestamptz + n * INTERVAL '1 hour'
+         FROM generate_series(1,13) n;
+         INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,bssid,observed_at)
+         VALUES ('late-match-a','02:00:00:00:00:0c','12:00:00:00:00:01','2026-09-20 13:00:00+00'),
+                ('late-match-b','02:00:00:00:00:0d','12:00:00:00:00:01','2026-09-20 13:10:00+00'),
+                ('other-ap-a','02:00:00:00:00:0c','12:00:00:00:00:02','2026-09-20 14:00:00+00'),
+                ('other-ap-b','02:00:00:00:00:0d','12:00:00:00:00:02','2026-09-20 14:10:00+00')",
+    );
+    store.project_infrastructure_graph(1).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT coverage_status='partial' AND projection_watermark_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM atheros_search.graph_edges WHERE edge_kind='roaming')
+            AND (SELECT checkpoint_value IS NOT NULL FROM octopus_core.processor_checkpoints
+                 WHERE processor_name='wireless-identity-projector' AND shard_id='graph-roaming')
+         FROM atheros_search.investigation_watermarks WHERE projection_name='graph_projection'",
+    )
+    .await;
+
+    let store = ProjectionStore::new(fixture.runtime.clone());
+    store.project_infrastructure_graph(1).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT weight=2 AND observed_at='2026-09-20 14:10:00+00'
+            AND (SELECT checkpoint_value IS NULL FROM octopus_core.processor_checkpoints
+                 WHERE processor_name='wireless-identity-projector' AND shard_id='graph-roaming')
+         FROM atheros_search.graph_edges
+         WHERE edge_id='roaming:02:00:00:00:00:0c:02:00:00:00:00:0d'",
+    )
+    .await;
+
+    fixture.admin(
+        "INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,bssid,observed_at)
+         VALUES ('early-match','02:00:00:00:00:02','12:00:00:00:00:01','2026-09-20 14:05:00+00')",
+    );
+    store.project_infrastructure_graph(1).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT weight=1 AND observed_at='2026-09-20 14:05:00+00'
+         FROM atheros_search.graph_edges
+         WHERE edge_id='roaming:02:00:00:00:00:01:02:00:00:00:00:02'",
     )
     .await;
 }
@@ -391,6 +558,48 @@ async fn signal_count_mismatches_remain_partial_until_each_bucket_is_repaired() 
 }
 
 #[tokio::test]
+async fn signal_summary_repairs_share_capacity_with_new_buckets() {
+    let Some(fixture) = Fixture::start().await else {
+        return;
+    };
+    let store = ProjectionStore::new(fixture.runtime.clone());
+    fixture.admin(
+        "INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,bssid,observed_at)
+         SELECT 'old-' || i, '02:00:00:00:00:01', '12:00:00:00:00:01',
+                date_trunc('hour', CURRENT_TIMESTAMP) - i * INTERVAL '5 minutes'
+         FROM generate_series(1, 3) i",
+    );
+    store.project_infrastructure_graph(10).await.unwrap();
+    fixture.admin(
+        "UPDATE atheros_search.wireless_signal_summaries SET frame_count=99;
+         INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,bssid,observed_at)
+         SELECT 'new-' || i, '02:00:00:00:00:02', '12:00:00:00:00:01',
+                date_trunc('hour', CURRENT_TIMESTAMP) - i * INTERVAL '5 minutes'
+         FROM generate_series(1, 3) i",
+    );
+    store.project_infrastructure_graph(2).await.unwrap();
+    let progress =
+        "SELECT count(*) FILTER (WHERE source_mac='02:00:00:00:00:01' AND frame_count=1),
+                           count(*) FILTER (WHERE source_mac='02:00:00:00:00:02')
+                    FROM atheros_search.wireless_signal_summaries";
+    for (expected_repairs, expected_new) in [(1, 1), (2, 1), (2, 2)] {
+        let mut tx = fixture.runtime.begin_worker().await.unwrap();
+        let rows = tx.query(progress, &[]).await.unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), expected_repairs);
+        assert_eq!(rows[0].get::<_, i64>(1), expected_new);
+        tx.commit().await.unwrap();
+        store.project_infrastructure_graph(1).await.unwrap();
+    }
+    store.project_infrastructure_graph(2).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT count(*) = 6 AND bool_and(frame_count = 1)
+         FROM atheros_search.wireless_signal_summaries",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn channel_only_evidence_counts_separately_only_when_its_time_window_is_unresolved() {
     let Some(fixture) = Fixture::start().await else {
         return;
@@ -458,12 +667,13 @@ async fn signal_timestamp_mismatches_remain_partial_until_each_bucket_is_repaire
     let store = ProjectionStore::new(fixture.runtime.clone());
     fixture.admin(
         "INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,bssid,observed_at) VALUES
-         ('a','02:00:00:00:00:01','12:00:00:00:00:01',CURRENT_TIMESTAMP),
-         ('b','02:00:00:00:00:02','12:00:00:00:00:01',CURRENT_TIMESTAMP)",
+         ('a','02:00:00:00:00:01','12:00:00:00:00:01','2020-01-02 13:03:00+00'),
+         ('b','02:00:00:00:00:02','12:00:00:00:00:01','2020-01-02 13:03:00+00')",
     );
     store.project_infrastructure_graph(10).await.unwrap();
     fixture.admin(
-        "UPDATE atheros_search.wireless_signal_summaries
+        "UPDATE octopus_core.wireless_frames SET updated_at=observed_at;
+         UPDATE atheros_search.wireless_signal_summaries
          SET last_observed_at=last_observed_at-INTERVAL '1 minute'",
     );
     store.project_infrastructure_graph(1).await.unwrap();
@@ -478,6 +688,117 @@ async fn signal_timestamp_mismatches_remain_partial_until_each_bucket_is_repaire
         &fixture,
         "SELECT coverage_status='complete' AND projection_watermark_at=source_watermark_at
          FROM atheros_search.investigation_watermarks WHERE projection_name='wireless_evidence'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn radio_backfill_keeps_stale_summary_buckets_partial_until_rebuilt() {
+    let Some(fixture) = Fixture::start().await else {
+        return;
+    };
+    let store = ProjectionStore::new(fixture.runtime.clone());
+    fixture.admin(
+        "INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,bssid,observed_at) VALUES
+           ('a','02:00:00:00:00:01','12:00:00:00:00:01','2020-01-02 13:03:00+00'),
+           ('b','02:00:00:00:00:02','12:00:00:00:00:01','2020-01-02 13:03:00+00')",
+    );
+    store.project_infrastructure_graph(10).await.unwrap();
+    fixture.admin(
+        "INSERT INTO octopus_core.sync_events
+           (dedupe_key,stream_name,observed_at,payload_ref,payload,status,producer,signal_dbm)
+         SELECT dedupe_key,'wireless.audit',observed_at,'{}','{}','completed','test',-50
+         FROM octopus_core.wireless_frames;
+         CREATE FUNCTION octopus_core.pause_radio_backfill() RETURNS trigger LANGUAGE plpgsql AS
+           $$BEGIN PERFORM pg_advisory_xact_lock(8292700); RETURN NEW; END$$;
+         CREATE TRIGGER pause_radio_backfill BEFORE UPDATE ON octopus_core.wireless_frames
+           FOR EACH ROW EXECUTE FUNCTION octopus_core.pause_radio_backfill()",
+    );
+    let mut blocker = fixture.runtime.begin_worker().await.unwrap();
+    let blocker_pid = blocker
+        .query(
+            "SELECT pg_backend_pid(), pg_advisory_xact_lock(8292700) IS NULL",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let normalization = {
+        let store = store.clone();
+        tokio::spawn(async move { store.normalize_wireless_frames(10).await })
+    };
+    let normalization_pid = wait_for_blocked_backend(&fixture, blocker_pid).await;
+    let graph_run = {
+        let store = store.clone();
+        tokio::spawn(async move { store.project_infrastructure_graph(1).await })
+    };
+    wait_for_blocked_backend(&fixture, normalization_pid).await;
+    blocker.commit().await.unwrap();
+    normalization.await.unwrap().unwrap();
+    graph_run.await.unwrap().unwrap();
+    assert_query(
+        &fixture,
+        "SELECT coverage_status='partial' AND projection_watermark_at=source_watermark_at
+            AND (SELECT COUNT(*) FROM atheros_search.wireless_signal_summaries
+                 WHERE frame_count=1 AND last_observed_at='2020-01-02 13:03:00+00'
+                   AND rssi_sample_count=1 AND rssi_avg_dbm=-50) = 1
+         FROM atheros_search.investigation_watermarks WHERE projection_name='wireless_evidence'",
+    )
+    .await;
+    store.project_infrastructure_graph(1).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT coverage_status='complete'
+            AND (SELECT COUNT(*) FROM atheros_search.wireless_signal_summaries
+                 WHERE rssi_sample_count=1 AND rssi_avg_dbm=-50) = 2
+         FROM atheros_search.investigation_watermarks WHERE projection_name='wireless_evidence'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pair_pages_keep_full_evidence_and_write_every_roaming_match() {
+    let Some(fixture) = Fixture::start().await else {
+        return;
+    };
+    let store = ProjectionStore::new(fixture.runtime.clone());
+    fixture.admin(
+        "INSERT INTO octopus_core.devices(mac_id, mac_hint)
+         SELECT mac, mac FROM unnest(ARRAY['02:00:00:00:00:01','02:00:00:00:00:02',
+                                         '02:00:00:00:00:03']) AS mac",
+    );
+    store.project_infrastructure_graph(10).await.unwrap();
+    fixture.admin(
+        "INSERT INTO octopus_core.wireless_frames(dedupe_key, source_mac, bssid, bssid_oui, observed_at)
+         SELECT mac_id || bssid, mac_id, bssid, oui, '2026-09-20 13:03:00+00'
+         FROM octopus_core.devices
+         CROSS JOIN (VALUES ('12:00:00:00:00:01', '120000'), ('14:00:00:00:00:01', '140000'))
+                    AS ap(bssid, oui);
+         INSERT INTO octopus_core.wireless_frame_radio(dedupe_key, frequency_mhz)
+         SELECT dedupe_key, CASE bssid_oui WHEN '120000' THEN 2412 ELSE 5955 END
+         FROM octopus_core.wireless_frames",
+    );
+    store.project_infrastructure_graph(1).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT count(*) FILTER (WHERE edge_kind = 'roaming') = 3
+            AND count(*) FILTER (WHERE edge_kind = 'same_channel') = 1
+            AND count(*) FILTER (WHERE edge_kind = 'vendor_link') = 1
+            AND bool_and(weight = 2)
+         FROM atheros_search.graph_edges
+         WHERE edge_kind IN ('roaming','same_channel','vendor_link')",
+    )
+    .await;
+    for _ in 0..2 {
+        store.project_infrastructure_graph(1).await.unwrap();
+    }
+    assert_query(
+        &fixture,
+        "SELECT count(*) FILTER (WHERE edge_kind = 'same_channel') = 3
+            AND count(*) FILTER (WHERE edge_kind = 'vendor_link') = 3
+            AND bool_and(weight = 2)
+         FROM atheros_search.graph_edges
+         WHERE edge_kind IN ('same_channel','vendor_link')",
     )
     .await;
 }

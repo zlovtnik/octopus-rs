@@ -1,5 +1,6 @@
 //! Claim ready inventory inputs once and project the claimed frames.
 
+// Hold frame values stable through both inventory upserts and the search mirror.
 // Parameters: batchLimit
 pub(super) const CLAIM_INVENTORY_INPUTS: &str = r#"INSERT INTO wireless_inventory_projection_inputs (dedupe_key, projected_at)
          SELECT candidate.dedupe_key, CURRENT_TIMESTAMP
@@ -19,9 +20,16 @@ pub(super) const CLAIM_INVENTORY_INPUTS: &str = r#"INSERT INTO wireless_inventor
              WHERE app_row.dedupe_key = candidate.dedupe_key
            )))
          ORDER BY candidate.created_at, candidate.dedupe_key
-         LIMIT $1::int FOR KEY SHARE OF candidate
+         LIMIT $1::int FOR SHARE OF candidate
          ON CONFLICT (dedupe_key) DO NOTHING
          RETURNING dedupe_key"#;
+
+// Replay device enrichment for direct frames claimed before their audit arrived.
+pub(super) const SELECT_ENRICHED_INVENTORY_INPUTS: &str = r#"SELECT applied.dedupe_key
+         FROM wireless_inventory_projection_inputs applied
+         JOIN wireless_frame_identity identity_row USING (dedupe_key)
+         JOIN wireless_frame_app_signals app_row USING (dedupe_key)
+         WHERE applied.dedupe_key = ANY($1::varchar[])"#;
 
 // Parameters: claimedKeys
 pub(super) const UPSERT_OBSERVED_DEVICES: &str = r#"INSERT INTO devices (

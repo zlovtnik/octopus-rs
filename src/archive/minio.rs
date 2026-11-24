@@ -193,7 +193,8 @@ impl MinioStore {
         bytes: Option<&[u8]>,
         sha_metadata: Option<&str>,
     ) -> Result<Response, ArchiveError> {
-        self.request_with_condition(method, key, query, bytes, sha_metadata, false).await
+        self.request_with_condition(method, key, query, bytes, sha_metadata, false)
+            .await
     }
 
     async fn request_with_condition(
@@ -371,20 +372,39 @@ impl MinioStore {
         let version = if let Some(existing) = self.stat_versioned(key, None).await? {
             existing.version_id.clone()
         } else {
-            let response = self.request_with_condition(Method::PUT, key, BTreeMap::new(), Some(bytes), Some(sha), true).await?;
+            let response = self
+                .request_with_condition(
+                    Method::PUT,
+                    key,
+                    BTreeMap::new(),
+                    Some(bytes),
+                    Some(sha),
+                    true,
+                )
+                .await?;
             if response.status() == StatusCode::PRECONDITION_FAILED {
-                self.stat_versioned(key, None).await?.ok_or(ArchiveError::Integrity)?.version_id
+                self.stat_versioned(key, None)
+                    .await?
+                    .ok_or(ArchiveError::Integrity)?
+                    .version_id
             } else if response.status().is_success() {
                 metadata(response.headers(), false)?.version_id
             } else {
                 return Err(status_error(response.status()));
             }
         };
-        let existing = self.stat_versioned(key, version.as_deref()).await?.ok_or(ArchiveError::Integrity)?;
-        if existing.size != bytes.len() as i64 || existing.sha256.as_deref().is_some_and(|value| value != sha) {
+        let existing = self
+            .stat_versioned(key, version.as_deref())
+            .await?
+            .ok_or(ArchiveError::Integrity)?;
+        if existing.size != bytes.len() as i64
+            || existing.sha256.as_deref().is_some_and(|value| value != sha)
+        {
             return Err(ArchiveError::Integrity);
         }
-        let stored = self.get_versioned(key, existing.version_id.as_deref(), bytes.len()).await?;
+        let stored = self
+            .get_versioned(key, existing.version_id.as_deref(), bytes.len())
+            .await?;
         if stored != bytes {
             return Err(ArchiveError::Integrity);
         }
@@ -423,11 +443,19 @@ impl MinioStore {
         let response = self
             .request(Method::DELETE, key, version_query(version)?, None, None)
             .await?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(status_error(response.status()))
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
         }
+        if let Some(version) = version.filter(|_| status == StatusCode::NOT_FOUND) {
+            let bytes = read_bounded(response, 8 * 1024).await?;
+            if let Ok(body) = std::str::from_utf8(&bytes) {
+                if is_missing_version(body, key, version) {
+                    return Ok(());
+                }
+            }
+        }
+        Err(status_error(status))
     }
 
     /// Bounded S3 version listing. Both cursors must be carried into the next
@@ -563,6 +591,141 @@ async fn read_bounded(response: Response, max_bytes: usize) -> Result<Vec<u8>, A
     Ok(bytes)
 }
 
+fn is_missing_version(body: &str, key: &str, version: &str) -> bool {
+    parse_delete_error_xml(body).is_some_and(|[code, object, object_version]| {
+        code.as_deref() == Some("NoSuchVersion")
+            && object.as_deref().is_none_or(|value| value == key)
+            && object_version
+                .as_deref()
+                .is_none_or(|value| value == version)
+    })
+}
+
+// Parse the bounded UTF-8 S3 error as XML 1.0. The token grammar deliberately
+// has no DTD or entity declarations. Text accepts only predefined and numeric
+// references, so parsing cannot resolve external resources.
+fn parse_delete_error_xml(body: &str) -> Option<[Option<String>; 3]> {
+    use std::{collections::HashSet, sync::LazyLock};
+
+    const NAME_START: &str = r":A-Z_a-z\u{C0}-\u{D6}\u{D8}-\u{F6}\u{F8}-\u{2FF}\u{370}-\u{37D}\u{37F}-\u{1FFF}\u{200C}-\u{200D}\u{2070}-\u{218F}\u{2C00}-\u{2FEF}\u{3001}-\u{D7FF}\u{F900}-\u{FDCF}\u{FDF0}-\u{FFFD}\u{10000}-\u{EFFFF}";
+    static NAME: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            r"[{NAME_START}][{NAME_START}.0-9\u{{B7}}\u{{300}}-\u{{36F}}\u{{203F}}-\u{{2040}}-]*"
+        )
+    });
+    static ATTR: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            r#"(?-x:[ \t\n]+)({})[\t\n\x20]*=[\t\n\x20]*(?:"([^"<]*)"|'([^'<]*)')"#,
+            *NAME
+        )
+    });
+    static ATTRIBUTES: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(&ATTR).expect("XML attribute grammar"));
+    static TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(&format!(
+            r#"(?sx)\A(?:
+                (?P<declaration><\?xml[\x20\t\n]+version[\x20\t\n]*=[\x20\t\n]*(?:"1\.0"|'1\.0')
+                    (?:[\x20\t\n]+encoding[\x20\t\n]*=[\x20\t\n]*(?:"(?i:utf-8)"|'(?i:utf-8)'))?
+                    (?:[\x20\t\n]+standalone[\x20\t\n]*=[\x20\t\n]*(?:"(?:yes|no)"|'(?:yes|no)'))?
+                    [\x20\t\n]*\?>)
+                | <!--(?P<comment>.*?)-->
+                | <!\[CDATA\[(?P<cdata>.*?)\]\]>
+                | </(?P<end>{name})[\x20\t\n]*>
+                | <(?P<start>{name})(?P<attributes>(?:{attribute})*)[\x20\t\n]*(?P<empty>/?)>
+                | <\?(?P<instruction>{name})(?:[\x20\t\n]+.*?)?\?>
+                | (?P<text>[^<]+)
+            )"#,
+            name = *NAME,
+            attribute = *ATTR,
+        ))
+        .expect("XML token grammar")
+    });
+
+    let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
+    let document = normalized.strip_prefix('\u{feff}').unwrap_or(&normalized);
+    if !document.chars().all(xml_character) {
+        return None;
+    }
+    let mut rest = document;
+    let mut root_seen = false;
+    let mut elements = Vec::new();
+    let mut values = [None, None, None];
+    let field = |name| {
+        ["Code", "Key", "VersionId"]
+            .iter()
+            .position(|tag| *tag == name)
+    };
+    while !rest.is_empty() {
+        let token = TOKEN.captures(rest)?;
+        let get = |name| token.name(name).map(|part| part.as_str());
+        let active = if elements.len() == 2 {
+            field(elements[1])
+        } else {
+            None
+        };
+        if let Some(name) = get("start") {
+            if elements.is_empty() {
+                if root_seen || name != "Error" {
+                    return None;
+                }
+                root_seen = true;
+            }
+            if active.is_some() {
+                return None;
+            }
+            if let Some(index) = field(name).filter(|_| elements.len() == 1) {
+                if values[index].replace(String::new()).is_some() {
+                    return None;
+                }
+            }
+            let mut names = HashSet::new();
+            for attribute in ATTRIBUTES.captures_iter(get("attributes")?) {
+                if !names.insert(attribute.get(1)?.as_str()) {
+                    return None;
+                }
+                let value = attribute.get(2).or_else(|| attribute.get(3))?.as_str();
+                decode_xml_text(value).ok()?;
+            }
+            if get("empty") == Some("") {
+                elements.push(name);
+            }
+        } else if let Some(name) = get("end") {
+            if elements.pop() != Some(name) {
+                return None;
+            }
+        } else if let Some(text) = get("text") {
+            if text.contains("]]>")
+                || (elements.is_empty() && !text.trim_matches([' ', '\t', '\n']).is_empty())
+            {
+                return None;
+            }
+            let text = decode_xml_text(text).ok()?;
+            if let Some(index) = active {
+                values[index].as_mut()?.push_str(&text);
+            }
+        } else if let Some(cdata) = get("cdata") {
+            if elements.is_empty() {
+                return None;
+            }
+            if let Some(index) = active {
+                values[index].as_mut()?.push_str(cdata);
+            }
+        } else if get("comment")
+            .is_some_and(|comment| comment.contains("--") || comment.ends_with('-'))
+            || get("instruction").is_some_and(|name| name.eq_ignore_ascii_case("xml"))
+            || (get("declaration").is_some() && rest.len() != document.len())
+        {
+            return None;
+        }
+        rest = &rest[token.get(0)?.end()..];
+    }
+    (root_seen && elements.is_empty()).then_some(values)
+}
+
+fn xml_character(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+}
+
 fn xml_text(xml: &str, tag: &str) -> Result<Option<String>, ArchiveError> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -573,8 +736,11 @@ fn xml_text(xml: &str, tag: &str) -> Result<Option<String>, ArchiveError> {
     let end = rest
         .find(&close)
         .ok_or(ArchiveError::Response("invalid version XML"))?;
+    decode_xml_text(&rest[..end]).map(Some)
+}
+
+fn decode_xml_text(mut text: &str) -> Result<String, ArchiveError> {
     let mut value = String::new();
-    let mut text = &rest[..end];
     while let Some(index) = text.find('&') {
         value.push_str(&text[..index]);
         text = &text[index + 1..];
@@ -588,14 +754,18 @@ fn xml_text(xml: &str, tag: &str) -> Result<Option<String>, ArchiveError> {
             "gt" => '>',
             "quot" => '"',
             "apos" => '\'',
-            v if v.starts_with("#x") => u32::from_str_radix(&v[2..], 16)
-                .ok()
-                .and_then(char::from_u32)
-                .ok_or(ArchiveError::Response("invalid XML escape"))?,
-            v if v.starts_with('#') => v[1..]
+            v if v.starts_with("#x") && v[2..].bytes().all(|b| b.is_ascii_hexdigit()) => {
+                u32::from_str_radix(&v[2..], 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .filter(|c| xml_character(*c))
+                    .ok_or(ArchiveError::Response("invalid XML escape"))?
+            }
+            v if v.starts_with('#') && v[1..].bytes().all(|b| b.is_ascii_digit()) => v[1..]
                 .parse::<u32>()
                 .ok()
                 .and_then(char::from_u32)
+                .filter(|c| xml_character(*c))
                 .ok_or(ArchiveError::Response("invalid XML escape"))?,
             _ => return Err(ArchiveError::Response("unsupported XML entity")),
         };
@@ -603,7 +773,7 @@ fn xml_text(xml: &str, tag: &str) -> Result<Option<String>, ArchiveError> {
         text = &text[end + 1..];
     }
     value.push_str(text);
-    Ok(Some(value))
+    Ok(value)
 }
 
 fn parse_versions(xml: &str) -> Result<ObjectVersions, ArchiveError> {
@@ -711,6 +881,89 @@ mod tests {
         )
         .is_err());
         assert!(xml_text("<Key>&evil;</Key>", "Key").is_err());
+    }
+
+    #[test]
+    fn delete_404_requires_an_unambiguous_missing_version() {
+        let key = "artifacts/a&b";
+        let version = "v1";
+        for (fields, accepted) in [
+            ("", true),
+            (
+                "<Key>artifacts/a&amp;b</Key><VersionId>v1</VersionId>",
+                true,
+            ),
+            ("<Key>artifacts/a&amp;b</Key>", true),
+            ("<VersionId>v1</VersionId>", true),
+            ("<Key>artifacts/a&amp;b</Key><Key>other</Key>", false),
+            ("<VersionId>v1</VersionId><VersionId>v1</VersionId>", false),
+            ("<VersionId>v1</VersionId><VersionId/>", false),
+            ("<Key>other</Key>", false),
+            ("<VersionId>v2</VersionId>", false),
+            ("<Code>NoSuchBucket</Code>", false),
+        ] {
+            let body =
+                format!("<?xml version=\"1.0\"?><Error><Code>NoSuchVersion</Code>{fields}</Error>");
+            assert_eq!(is_missing_version(&body, key, version), accepted, "{body}");
+        }
+        for body in [
+            "",
+            "<Error><Code>NoSuchBucket</Code></Error>",
+            "<Error><Details><Code>NoSuchVersion</Code></Details></Error>",
+            "<Error><Code>NoSuchVersion</Code><Other></Wrong></Error>",
+            "<Error/><Error><Code>NoSuchVersion</Code></Error>",
+            "<Error><Code>NoSuchVersion</Code><Key>&undefined;</Key></Error>",
+            "<Error><Code>NoSuchVersion</Code><Key>&#0;</Key></Error>",
+            "<Error><Code>NoSuchVersion</Code><Other a='x' a='y'/></Error>",
+            "<Error><Code>NoSuchVersion</Code><Other>bad]]></Other></Error>",
+            "<Error><Code>NoSuchVersion</Code><!-- bad -- comment --></Error>",
+            "<!DOCTYPE Error SYSTEM 'https://example.test/dtd'><Error><Code>NoSuchVersion</Code></Error>",
+            "<!DOCTYPE Error [<!ENTITY value 'NoSuchVersion'>]><Error><Code>&value;</Code></Error>",
+        ] {
+            assert!(!is_missing_version(body, key, version), "{body}");
+        }
+        assert!(is_missing_version(
+            "<?xml version='1.0' encoding='UTF-8'?><Error><!-- <Key>ignored</Key> --><VersionId>v1</VersionId><Code><![CDATA[NoSuchVersion]]></Code><Detail request='example'/></Error>",
+            key,
+            version,
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_only_accepts_missing_version_body_for_versioned_404() {
+        use axum::{routing::delete, Router};
+
+        const BODY: &str = "<Error><Code>NoSuchVersion</Code><VersionId>v1</VersionId></Error>";
+        let router = Router::new()
+            .route(
+                "/bucket/missing",
+                delete(|| async { (StatusCode::NOT_FOUND, BODY) }),
+            )
+            .route(
+                "/bucket/error",
+                delete(|| async { (StatusCode::INTERNAL_SERVER_ERROR, BODY) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let store = MinioStore::new(&endpoint, "key", "secret", "us-east-1", "bucket").unwrap();
+
+        store.delete("missing", Some("v1")).await.unwrap();
+        assert!(matches!(
+            store.delete("error", Some("v1")).await,
+            Err(ArchiveError::Storage {
+                status: Some(500),
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.delete("missing", None).await,
+            Err(ArchiveError::Storage {
+                status: Some(404),
+                ..
+            })
+        ));
+        server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]

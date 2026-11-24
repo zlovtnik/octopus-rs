@@ -1,4 +1,7 @@
 //! Real five-lane broker/application exercise, distinct from librdkafka mocks.
+// Exercise the binary's scheduler with the same fixture as the broker lanes.
+#[path = "../src/application/workloads.rs"]
+mod scheduled;
 mod support;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -10,12 +13,13 @@ use octopus::{
     ingestion::IngestionStore,
     kafka::{consumer_settings, producer, CommitObserver, Poison},
     load::LoadStore,
+    observability::Metrics,
     postgres::PostgresErrorClass,
     processor::ProcessorId,
     projections::{decode_wireless, ProjectionError, ProjectionStore, WirelessObservation},
     runtime::{
-        consumer_workloads_observed, Backpressure, DispatchOutcome, OutboxPublisher, Planner,
-        RuntimeError, WirelessProjectionHandler, HEARTBEAT_TOPIC,
+        consumer_workloads_observed, Backpressure, Planner, RuntimeError,
+        WirelessProjectionHandler, HEARTBEAT_TOPIC,
     },
     supervision::Supervisor,
     util::sha256_hex,
@@ -39,6 +43,8 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+type Result<T = (), E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
+
 const REDPANDA:&str="redpandadata/redpanda:v24.2.7@sha256:82a69763bef8d8b55ea5a520fa1b38f993908ef68946819ca1aed43541824c48";
 #[derive(Default)]
 struct Committed(AtomicU64);
@@ -54,18 +60,15 @@ async fn real_outbox_waits_for_broker_ack_and_retries_after_outage() {
         return;
     };
     let broker = Broker::start().await;
-    let cfg = KafkaCfg {
-        bootstrap_servers: broker.bootstrap.clone(),
-        topic_replication_factor: 1,
-        topic_partitions: 1,
-        ..KafkaCfg::default()
-    };
+    let mut cfg = AppConfig::default();
+    cfg.kafka.bootstrap_servers = broker.bootstrap.clone();
+    cfg.kafka.topic_replication_factor = 1;
+    cfg.kafka.topic_partitions = 1;
+    cfg.cron.batch_dispatch_lease_seconds = 5;
+    cfg.cron.idle_sleep_ms = 50;
     broker
-        .create_topics(&[cfg.load_topic.clone(), cfg.result_topic.clone()])
+        .create_topics(&[cfg.kafka.load_topic.clone(), cfg.kafka.result_topic.clone()])
         .await;
-    let dispatch = DispatchStore::new(fixture.runtime.clone());
-    let publisher =
-        OutboxPublisher::new(dispatch.clone(), &cfg, "runtime-publisher".into(), 5, 1, 10).unwrap();
     fixture.admin("INSERT INTO octopus_core.outbox_events(outbox_id,source_type,source_id,event_type,destination_topic,message_key,payload) VALUES(gen_random_uuid(),'test','result-1','result','sync.oracle.result','result-1','{\"value\":1}')");
     support::checked(Command::new("docker").args(["pause", &broker.name]));
     struct Resume(String);
@@ -75,50 +78,86 @@ async fn real_outbox_waits_for_broker_ack_and_retries_after_outage() {
         }
     }
     let resume = Resume(broker.name.clone());
-    assert_eq!(
-        publisher.dispatch_next().await.unwrap(),
-        DispatchOutcome::StopDraining
-    );
-    let mut tx = fixture.runtime.begin_worker().await.unwrap();
-    let row=tx.query("SELECT status,published_at IS NULL,attempt_count FROM outbox_events WHERE source_id='result-1'",&[]).await.unwrap();
-    // The publish deadline leaves an unacknowledged lease for backlog recovery.
-    assert_eq!(row[0].get::<_, String>(0), "leased");
-    assert!(row[0].get::<_, bool>(1));
-    assert_eq!(row[0].get::<_, i32>(2), 1);
-    tx.commit().await.unwrap();
-    fixture.admin("UPDATE octopus_core.outbox_events SET lease_expires_at=clock_timestamp()-INTERVAL '1 second' WHERE source_id='result-1'");
-    assert_eq!(dispatch.recover_expired().await.unwrap(), 1);
+    let stop = CancellationToken::new();
+    let task = start_scheduled(
+        &fixture,
+        &cfg,
+        BTreeSet::from([
+            ProcessorId::SyncOutboxPublisher,
+            ProcessorId::SyncBacklogRecovery,
+        ]),
+        &stop,
+    )
+    .await;
+    await_database_condition(&fixture, "SELECT EXISTS(SELECT 1 FROM outbox_events WHERE source_id='result-1' AND status='leased' AND attempt_count=1 AND published_at IS NULL)").await;
+    // Keep Kafka offline through lease expiry. Only scheduled recovery can
+    // make the leased row claimable again, so the second lease proves recovery.
+    await_database_condition(&fixture, "SELECT EXISTS(SELECT 1 FROM outbox_events WHERE source_id='result-1' AND status='leased' AND attempt_count=2 AND published_at IS NULL AND last_error='publish lease expired; retrying')").await;
     drop(resume);
-    assert_eq!(
-        publisher.dispatch_next().await.unwrap(),
-        DispatchOutcome::Dispatched
-    );
+    await_database_condition(&fixture, "SELECT EXISTS(SELECT 1 FROM outbox_events WHERE source_id='result-1' AND status='published' AND published_at IS NOT NULL)").await;
     let mut tx = fixture.runtime.begin_worker().await.unwrap();
-    let row=tx.query("SELECT status,published_at IS NOT NULL,attempt_count FROM outbox_events WHERE source_id='result-1'",&[]).await.unwrap();
-    assert_eq!(row[0].get::<_, String>(0), "published");
-    assert!(row[0].get::<_, bool>(1));
-    assert_eq!(row[0].get::<_, i32>(2), 2);
+    let runs = tx.query("SELECT count(*) FILTER (WHERE status='running'),count(*) FROM processor_runs WHERE processor_name IN ('sync-backlog-recovery','sync-outbox-publisher')", &[]).await.unwrap();
+    assert_eq!(runs[0].get::<_, i64>(0), 2);
+    assert_eq!(runs[0].get::<_, i64>(1), 2);
     tx.commit().await.unwrap();
     // Malformed load identity is parked before publication.
     fixture.admin("INSERT INTO octopus_core.outbox_events(outbox_id,source_type,source_id,event_type,destination_topic,message_key,payload) VALUES(gen_random_uuid(),'test','malformed-load','load','sync.oracle.load','malformed:1','{\"batch_id\":\"invalid\"}')");
-    assert_eq!(
-        publisher.dispatch_next().await.unwrap(),
-        DispatchOutcome::ContinueDraining
-    );
-    let observer: BaseConsumer = consumer_settings(&cfg, "runtime-publisher-proof-v1")
+    await_database_condition(&fixture, "SELECT EXISTS(SELECT 1 FROM outbox_events WHERE source_id='malformed-load' AND status='failed' AND published_at IS NULL)").await;
+    let observer: BaseConsumer = consumer_settings(&cfg.kafka, "runtime-publisher-proof-v1")
         .unwrap()
         .create()
         .unwrap();
     let (_, high) = observer
-        .fetch_watermarks(&cfg.load_topic, 0, Duration::from_secs(5))
+        .fetch_watermarks(&cfg.kafka.load_topic, 0, Duration::from_secs(5))
         .unwrap();
     assert_eq!(high, 0);
-    let mut tx = fixture.runtime.begin_worker().await.unwrap();
-    let row=tx.query("SELECT status,published_at IS NOT NULL FROM outbox_events WHERE source_id='malformed-load'",&[]).await.unwrap();
-    assert_eq!(row[0].get::<_, String>(0), "failed");
-    assert!(!row[0].get::<_, bool>(1));
-    tx.commit().await.unwrap();
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
+
+async fn start_scheduled(
+    fixture: &support::Fixture,
+    config: &AppConfig,
+    enabled: BTreeSet<ProcessorId>,
+    stop: &CancellationToken,
+) -> tokio::task::JoinHandle<Result<(), octopus::supervision::SupervisionError>> {
+    scheduled::validate(&enabled).unwrap();
+    let workloads = scheduled::build(
+        config,
+        &enabled,
+        fixture.runtime.clone(),
+        Backpressure::new(fixture.runtime.clone(), 100, 4).unwrap(),
+        &Metrics::with_rate_window(config.public_stats.rate_window_seconds).unwrap(),
+    )
+    .unwrap();
+    let supervisor =
+        Supervisor::create(config.processors.clone(), enabled, fixture.runtime.clone())
+            .await
+            .unwrap();
+    let stop = stop.clone();
+    tokio::spawn(async move { supervisor.run(workloads, stop).await })
+}
+
+async fn await_database_condition(fixture: &support::Fixture, query: &str) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let mut tx = fixture.runtime.begin_worker().await.unwrap();
+            let ready = tx.query(query, &[]).await.unwrap()[0].get::<_, bool>(0);
+            tx.commit().await.unwrap();
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("database condition did not converge: {query}"));
+}
+
 struct Broker {
     name: String,
     bootstrap: String,
@@ -289,6 +328,9 @@ async fn five_consumers_use_real_redpanda_and_commit_only_after_postgres_or_dlq(
     };
     cfg.wireless.projection.mode = "projected".into();
     cfg.runtime.consumers_enabled = true;
+    cfg.ingest
+        .stream_names
+        .retain(|stream| stream != "wireless.audit");
     cfg.ingest.load_stream_names = vec!["proxy.events".into()];
     let bindings = [
         (
@@ -565,13 +607,14 @@ async fn drain_retained_batches(
     result_observer: &BaseConsumer,
 ) {
     let mut prior = config.clone();
+    prior.ingest.stream_names.push(" wireless.audit ".into());
     prior
         .ingest
         .load_stream_names
         .push(" wireless.audit ".into());
     let dispatch = DispatchStore::new(fixture.runtime.clone());
     dispatch
-        .ensure_cursors(&prior.ingest.load_stream_names)
+        .ensure_cursors(&prior.ingest.stream_names)
         .await
         .unwrap();
     let payload = json!({
@@ -618,27 +661,28 @@ async fn drain_retained_batches(
         current_planner.reconcile_excluded_pending().await.unwrap(),
         1
     );
-    assert_eq!(dispatch.enqueue_pending(10, 5).await.unwrap(), 1);
-    assert_eq!(dispatch.enqueue_pending(10, 5).await.unwrap(), 0);
-    let publisher = OutboxPublisher::new(
-        dispatch,
-        &config.kafka,
-        "retained-publisher".into(),
-        30,
-        1,
-        10,
+    let mut scheduled_config = config.clone();
+    scheduled_config.cron.idle_sleep_ms = 50;
+    let stop = CancellationToken::new();
+    let task = start_scheduled(
+        fixture,
+        &scheduled_config,
+        BTreeSet::from([
+            ProcessorId::SyncLoadDispatch,
+            ProcessorId::SyncOutboxPublisher,
+            ProcessorId::SyncBacklogRecovery,
+        ]),
+        &stop,
     )
-    .unwrap();
-    assert_eq!(
-        publisher.dispatch_next().await.unwrap(),
-        DispatchOutcome::Dispatched
-    );
+    .await;
     await_offset(load_observer, &config.kafka.load_topic, 2).await;
-    assert_eq!(
-        publisher.dispatch_next().await.unwrap(),
-        DispatchOutcome::Dispatched
-    );
     await_offset(result_observer, &config.kafka.result_topic, 2).await;
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 
     let mut tx = fixture.runtime.begin_worker().await.unwrap();
     let rows = tx.query(

@@ -32,6 +32,7 @@ pub(super) const INSERT_MISSING_RADIO_AND_TOUCH_FRAMES: &str = r#"WITH missing A
            ) AND EXISTS (
              SELECT 1 FROM sync_events event
              WHERE event.dedupe_key = frame.dedupe_key AND event.stream_name = 'wireless.audit'
+               AND (event.payload IS NOT NULL OR event.payload_archived = true)
            )
            ORDER BY frame.observed_at, frame.dedupe_key
            LIMIT $1::int), inserted AS (INSERT INTO wireless_frame_radio (
@@ -58,6 +59,7 @@ pub(super) const INSERT_MISSING_QOS: &str = r#"WITH missing AS MATERIALIZED (SEL
            ) AND EXISTS (
              SELECT 1 FROM sync_events event
              WHERE event.dedupe_key = frame.dedupe_key AND event.stream_name = 'wireless.audit'
+               AND (event.payload IS NOT NULL OR event.payload_archived = true)
            )
            ORDER BY frame.observed_at, frame.dedupe_key
            LIMIT $1::int) INSERT INTO wireless_frame_qos (
@@ -80,6 +82,7 @@ pub(super) const INSERT_MISSING_NETWORK: &str = r#"WITH missing AS MATERIALIZED 
            ) AND EXISTS (
              SELECT 1 FROM sync_events event
              WHERE event.dedupe_key = frame.dedupe_key AND event.stream_name = 'wireless.audit'
+               AND (event.payload IS NOT NULL OR event.payload_archived = true)
            )
            ORDER BY frame.observed_at, frame.dedupe_key
            LIMIT $1::int) INSERT INTO wireless_frame_network (
@@ -104,6 +107,7 @@ pub(super) const INSERT_MISSING_APP_SIGNALS: &str = r#"WITH missing AS MATERIALI
            ) AND EXISTS (
              SELECT 1 FROM sync_events event
              WHERE event.dedupe_key = frame.dedupe_key AND event.stream_name = 'wireless.audit'
+               AND (event.payload IS NOT NULL OR event.payload_archived = true)
            )
            ORDER BY frame.observed_at, frame.dedupe_key
            LIMIT $1::int) INSERT INTO wireless_frame_app_signals (
@@ -115,7 +119,7 @@ pub(super) const INSERT_MISSING_APP_SIGNALS: &str = r#"WITH missing AS MATERIALI
              FROM missing
              JOIN sync_events e ON e.dedupe_key = missing.dedupe_key
              WHERE e.stream_name = 'wireless.audit'
-             ON CONFLICT (dedupe_key) DO NOTHING"#;
+             ON CONFLICT (dedupe_key) DO NOTHING RETURNING dedupe_key"#;
 
 // Parameters: batchLimit
 pub(super) const INSERT_MISSING_IDENTITY: &str = r#"WITH missing AS MATERIALIZED (SELECT frame.dedupe_key
@@ -126,6 +130,7 @@ pub(super) const INSERT_MISSING_IDENTITY: &str = r#"WITH missing AS MATERIALIZED
            ) AND EXISTS (
              SELECT 1 FROM sync_events event
              WHERE event.dedupe_key = frame.dedupe_key AND event.stream_name = 'wireless.audit'
+               AND (event.payload IS NOT NULL OR event.payload_archived = true)
            )
            ORDER BY frame.observed_at, frame.dedupe_key
            LIMIT $1::int) INSERT INTO wireless_frame_identity (
@@ -140,7 +145,7 @@ pub(super) const INSERT_MISSING_IDENTITY: &str = r#"WITH missing AS MATERIALIZED
              FROM missing
              JOIN sync_events e ON e.dedupe_key = missing.dedupe_key
              WHERE e.stream_name = 'wireless.audit'
-             ON CONFLICT (dedupe_key) DO NOTHING"#;
+             ON CONFLICT (dedupe_key) DO NOTHING RETURNING dedupe_key"#;
 
 // Parameters: batchLimit
 pub(super) const INSERT_MISSING_SECURITY: &str = r#"WITH missing AS MATERIALIZED (SELECT frame.dedupe_key
@@ -151,6 +156,7 @@ pub(super) const INSERT_MISSING_SECURITY: &str = r#"WITH missing AS MATERIALIZED
            ) AND EXISTS (
              SELECT 1 FROM sync_events event
              WHERE event.dedupe_key = frame.dedupe_key AND event.stream_name = 'wireless.audit'
+               AND (event.payload IS NOT NULL OR event.payload_archived = true)
            )
            ORDER BY frame.observed_at, frame.dedupe_key
            LIMIT $1::int) INSERT INTO wireless_frame_security (

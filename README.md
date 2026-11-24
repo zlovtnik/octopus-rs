@@ -114,6 +114,8 @@ builder, checks formatting and Clippy warnings, runs locked instrumented Cargo
 tests, enforces coverage and performs a locked release build. It sets
 `OCTOPUS_REQUIRE_DOCKER=true`; future integration tests must honor that contract
 and fail when their database/broker prerequisites are unavailable.
+The identity review contracts also require Docker by default. Without Docker,
+set `OCTOPUS_REQUIRE_DOCKER=false` locally to skip those contracts explicitly.
 
 Native validation collects `artifacts/octopus-coverage/` and the
 `artifacts/octopus` binary before container cleanup. Shared

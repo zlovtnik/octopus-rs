@@ -1,6 +1,8 @@
 //! Maintained projection queries. All identifiers are compile-time literals.
 
-// Parameters: 1=minimumSimilarity .max(-1.0d) .min(1.0d), 2=limit.max(1)
+// Parameters: 1=minimumSimilarity .max(-1.0d) .min(1.0d), 2=limit.max(1), 3=AutomaticMergeSimilarity
+// Expired pending candidates can be reconsidered when newer evidence arrives.
+// A qualifying newer score can also replace a below-threshold refresh of a pending candidate.
 pub const SELECT_SIMILARITY_EDGES: &str = r#"SELECT left_source_mac, right_source_mac, cosine_similarity
            FROM atheros_search.similarity_pairs pair
            JOIN atheros_search.search_documents left_document
@@ -23,12 +25,23 @@ pub const SELECT_SIMILARITY_EDGES: &str = r#"SELECT left_source_mac, right_sourc
                          WHERE device.mac = pair.right_source_mac AND device.location_id = policy.authorized_scope)
                ))
              )
-             AND NOT EXISTS (
-               SELECT 1 FROM atheros_search.merge_candidates candidate
-               WHERE candidate.confidence >= pair.cosine_similarity
-                 AND ((candidate.mac_a = pair.left_source_mac AND candidate.mac_b = pair.right_source_mac)
+             AND NOT COALESCE((
+               SELECT candidate.confidence >= pair.cosine_similarity
+                 AND NOT COALESCE(decision.candidate_id IS NULL AND candidate.status = 'pending'
+                       AND candidate.computed_at < pair.computed_at AND pair.cosine_similarity >= $3
+                       AND jsonb_typeof(candidate.evidence->'latest_similarity') = 'number'
+                       AND candidate.evidence->'latest_similarity' < to_jsonb($3::double precision), FALSE)
+               FROM atheros_search.merge_candidates candidate
+               LEFT JOIN atheros_search.merge_decisions decision USING (candidate_id)
+               WHERE ((candidate.mac_a = pair.left_source_mac AND candidate.mac_b = pair.right_source_mac)
                    OR (candidate.mac_a = pair.right_source_mac AND candidate.mac_b = pair.left_source_mac))
-             )
+                 AND (decision.candidate_id IS NOT NULL OR candidate.status <> 'pending'
+                      OR candidate.expires_at IS NULL OR candidate.expires_at > CURRENT_TIMESTAMP
+                      OR candidate.computed_at >= pair.computed_at)
+               ORDER BY (decision.candidate_id IS NOT NULL) DESC,
+                        (candidate.mac_a COLLATE "C" > candidate.mac_b COLLATE "C") DESC
+               LIMIT 1
+             ), FALSE)
            ORDER BY pair.computed_at, pair.pair_id
            LIMIT $2::int"#;
 
@@ -52,6 +65,14 @@ pub const SELECT_APPROVED_IDENTITY_EDGES: &str = r#"SELECT candidate.mac_a, cand
                    FROM atheros_search.merge_decisions decision
                    WHERE decision.candidate_id = candidate.candidate_id
                  )
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM atheros_search.merge_candidates reverse_candidate
+                   JOIN atheros_search.merge_decisions decision USING (candidate_id)
+                   WHERE reverse_candidate.mac_a = candidate.mac_b
+                     AND reverse_candidate.mac_b = candidate.mac_a
+                     AND decision.decision <> 'merge'
+                 )
                  AND EXISTS (
                    SELECT 1
                    FROM atheros_search.devices left_device
@@ -68,14 +89,27 @@ pub const SELECT_APPROVED_IDENTITY_EDGES: &str = r#"SELECT candidate.mac_a, cand
            ORDER BY candidate.confirmed_at, candidate.candidate_id"#;
 
 // Parameters: 1=candidateId, 2=ordered.head, 3=ordered.last, 4=confidence .max(0.0d) .min(1.0d), 5=runId
-pub const UPSERT_MERGE_CANDIDATE: &str = r#"WITH refreshed_reverse AS (
+// Both queries prefer a human decision and fall back to the legacy reverse row.
+pub const UPSERT_MERGE_CANDIDATE: &str = r#"WITH refreshed AS (
              UPDATE atheros_search.merge_candidates SET
                confidence = GREATEST(confidence, $4),
+               evidence = (CASE WHEN jsonb_typeof(evidence) = 'object' THEN evidence
+                                ELSE jsonb_build_object('legacy_evidence', evidence) END)
+                          || jsonb_build_object('latest_similarity', $4),
                computed_at = CURRENT_TIMESTAMP,
                expires_at = CURRENT_TIMESTAMP + INTERVAL '30 days',
                projection_run_id = $5,
                updated_at = CURRENT_TIMESTAMP
-             WHERE mac_a = $3 AND mac_b = $2
+             WHERE candidate_id = (
+               SELECT candidate.candidate_id
+               FROM atheros_search.merge_candidates candidate
+               LEFT JOIN atheros_search.merge_decisions decision USING (candidate_id)
+               WHERE (candidate.mac_a = $2 AND candidate.mac_b = $3)
+                  OR (candidate.mac_a = $3 AND candidate.mac_b = $2)
+               ORDER BY (decision.candidate_id IS NOT NULL) DESC,
+                        (candidate.mac_a COLLATE "C" > candidate.mac_b COLLATE "C") DESC
+               LIMIT 1
+             )
              RETURNING candidate_id
            ), inserted AS (
            INSERT INTO atheros_search.merge_candidates (
@@ -84,18 +118,21 @@ pub const UPSERT_MERGE_CANDIDATE: &str = r#"WITH refreshed_reverse AS (
            ) SELECT
              $1, $2, $3, $4,
              CURRENT_TIMESTAMP, 'pending',
-             jsonb_build_object('source', 'similarity_pairs'),
+             jsonb_build_object('source', 'similarity_pairs', 'latest_similarity', $4),
              (CURRENT_TIMESTAMP + (30) * INTERVAL '1 day'), $5
-           WHERE NOT EXISTS (SELECT 1 FROM refreshed_reverse)
+           WHERE NOT EXISTS (SELECT 1 FROM refreshed)
            ON CONFLICT (mac_a, mac_b) DO UPDATE SET
              confidence = GREATEST(merge_candidates.confidence, EXCLUDED.confidence),
+             evidence = (CASE WHEN jsonb_typeof(merge_candidates.evidence) = 'object' THEN merge_candidates.evidence
+                              ELSE jsonb_build_object('legacy_evidence', merge_candidates.evidence) END)
+                        || jsonb_build_object('latest_similarity', EXCLUDED.confidence),
              computed_at = EXCLUDED.computed_at,
              expires_at = EXCLUDED.expires_at,
              projection_run_id = EXCLUDED.projection_run_id,
              updated_at = CURRENT_TIMESTAMP
            RETURNING candidate_id
            )
-           SELECT candidate_id FROM refreshed_reverse
+           SELECT candidate_id FROM refreshed
            UNION ALL SELECT candidate_id FROM inserted"#;
 
 // Parameters: 1=limit.max(1)

@@ -120,6 +120,17 @@ fn artifacts_and_retention_reject_scope_traversal_and_unpinned_versions() {
     let run = json!({"installation_id":"dq-test","namespace":"native","run_id":"r","current_attempt":{"attempt_id":"a"}});
     let r = reference("r", None);
     assert!(dq_runtime::artifacts::object_key(&r, &run, false, &c).is_ok());
+    let mut legacy = r;
+    let legacy_key = format!("dq-test/native/inputs/legacy-owner/{}", "c".repeat(64));
+    legacy["uri"] = json!(format!("s3://{}/{legacy_key}", c.artifact_bucket));
+    assert_eq!(
+        dq_runtime::artifacts::object_key(&legacy, &run, false, &c).unwrap(),
+        legacy_key
+    );
+    code(
+        dq::validate_artifacts(&json!([legacy]), &c.settings(), "r", None, true),
+        "forbidden_artifact_reference",
+    );
     let out = reference("r", Some("a"));
     assert!(dq_runtime::artifacts::object_key(&out, &run, true, &c).is_ok());
     let mut invalid = out.clone();
@@ -400,13 +411,88 @@ async fn artifact_admission_requires_an_unclaimed_run_owned_version() {
         .complete_preparation(owner, "prep", &json!([owned]), &revision)
         .await
         .unwrap());
+
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    tx.execute(
+        "UPDATE dq_runs SET status='applying', work_owner='applier',
+            work_expires_at=CURRENT_TIMESTAMP + INTERVAL '1 minute' WHERE run_id=$1",
+        &[&owner],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    store
+        .fail_work(owner, "applier", "source_revision_changed", false, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_run(&principal, owner).await.unwrap()["input_refs"],
+        json!([])
+    );
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    tx.execute(
+        "UPDATE dq_runs SET next_attempt_at=CURRENT_TIMESTAMP WHERE run_id=$1",
+        &[&owner],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        store.claim_preparation("retry", 60, 1).await.unwrap()[0]["run_id"],
+        owner
+    );
+
+    let mut mismatched = alternate.clone();
+    mismatched["etag"] = json!("different");
+    code(
+        store
+            .complete_preparation(owner, "retry", &json!([mismatched]), &revision)
+            .await,
+        "artifact_identity_conflict",
+    );
+    let expected_refs = json!([alternate]);
+    assert!(store
+        .complete_preparation(owner, "retry", &expected_refs, &revision)
+        .await
+        .unwrap());
+    assert_eq!(
+        store.get_run(&principal, owner).await.unwrap()["input_refs"],
+        expected_refs
+    );
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    let artifacts = tx
+        .query(
+            "SELECT reference FROM dq_artifacts WHERE run_id=$1",
+            &[&owner],
+        )
+        .await
+        .unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].get::<_, Value>(0), expected_refs[0]);
+    let invokes = tx
+        .query(
+            "SELECT payload->'artifacts' FROM dq_outbox WHERE topic='dq.commands.v1'
+               AND payload->>'run_id'=$1 AND payload->>'event_type'='invoke' ORDER BY created_at",
+            &[&owner],
+        )
+        .await
+        .unwrap();
+    assert_eq!(invokes.len(), 2);
+    assert_eq!(invokes[1].get::<_, Value>(0), expected_refs);
+    tx.commit().await.unwrap();
 }
 
 #[tokio::test]
 async fn interrupted_retention_hides_and_retries_the_deleted_version() {
     use axum::{http::StatusCode, routing::delete, Router};
     use octopus::{config::ArchiveConfig, dq_runtime::DqArtifacts};
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     let Some(fixture) = support::Fixture::start().await else {
         return;
@@ -448,9 +534,12 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
     .await
     .unwrap();
     tx.execute(
-        "INSERT INTO dq_artifacts (artifact_id,run_id,reference,installation_id,namespace)
-         VALUES ($1,$2,$3,'dq-test','native'), ($4,$2,$5,'dq-test','native'),
-                ($6,$2,$7,'dq-test','native'), ($8,$2,$9,'dq-test','native')",
+        "INSERT INTO dq_artifacts
+           (artifact_id,run_id,reference,installation_id,namespace,closed_at,retained_until)
+         SELECT artifact.id, run_id, artifact.ref, installation_id, namespace,
+                completed_at, completed_at + INTERVAL '90 days'
+         FROM dq_runs CROSS JOIN (VALUES ($1::text,$3::jsonb), ($4,$5), ($6,$7), ($8,$9)) artifact(id, ref)
+         WHERE run_id=$2",
         &[
             &artifact,
             &run_id,
@@ -468,6 +557,15 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
     tx.execute(
         "UPDATE dq_runs SET input_refs=$2 WHERE run_id=$1",
         &[&legacy_run, &json!([shared])],
+    )
+    .await
+    .unwrap();
+    let shard = octopus::util::sha256_hex(json!(["dq-test", "native"]).to_string());
+    tx.execute(
+        "INSERT INTO processor_checkpoints (processor_name, shard_id, checkpoint_value)
+         VALUES ('dq-artifact-retention', $1,
+                 jsonb_build_array((CURRENT_TIMESTAMP + INTERVAL '2 days')::text, 'prior')::text)",
+        &[&shard],
     )
     .await
     .unwrap();
@@ -534,6 +632,14 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
         json!([shared])
     );
     // A later reopening can still retain the unclaimed artifact.
+    let later = store
+        .admit(&principal, &request("retention-after-failure"))
+        .await
+        .unwrap();
+    let later_run = later["run_id"].as_str().unwrap();
+    let mut later = reference(later_run, None);
+    later["version_id"] = json!("version-3");
+    let later_id = later["artifact_id"].as_str().unwrap();
     let mut tx = fixture.runtime.begin_worker().await.unwrap();
     tx.execute(
         "UPDATE dq_runs SET projection_applied=true WHERE run_id=$1",
@@ -541,18 +647,92 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
     )
     .await
     .unwrap();
+    tx.execute(
+        "UPDATE dq_runs SET status='succeeded', completed_at=CURRENT_TIMESTAMP - INTERVAL '90 days 1 hour',
+             input_refs=$2 WHERE run_id=$1",
+        &[&later_run, &json!([later])],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO dq_artifacts (artifact_id,run_id,reference,installation_id,namespace)
+         VALUES ($1,$2,$3,'dq-test','native')",
+        &[&later_id, &later_run, &later],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE dq_outbox SET status='published', published_at=CURRENT_TIMESTAMP WHERE payload->>'run_id'=$1",
+        &[&later_run],
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
 
-    let app = Router::new().fallback_service(delete(|uri: axum::http::Uri| async move {
-        assert_eq!(uri.query(), Some("versionId=version-1"));
-        StatusCode::NOT_FOUND
+    let deleted = Arc::new(AtomicUsize::new(0));
+    let calls = deleted.clone();
+    let app = Router::new().fallback_service(delete(move |uri: axum::http::Uri| {
+        let calls = calls.clone();
+        async move {
+            if uri.query() == Some("versionId=version-3") {
+                return (StatusCode::NO_CONTENT, "");
+            }
+            assert_eq!(uri.query(), Some("versionId=version-1"));
+            let body = match calls.fetch_add(1, Ordering::Relaxed) {
+                0 => "",
+                1 => "<Error><Code>NoSuchBucket</Code></Error>",
+                2 => "<?xml version=\"1.0\"?><Error><Code>NoSuchVersion</Code><VersionId>version-1</VersionId></Error>",
+                _ => panic!("unexpected deletion retry"),
+            };
+            (StatusCode::NOT_FOUND, body)
+        }
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let artifacts =
         DqArtifacts::new(config.clone(), &storage(listener.local_addr().unwrap())).unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let retry_id = octopus::util::sha256_hex(artifact);
+    for calls in 1..=2 {
+        code(
+            store.collect_retention(&artifacts, &config).await,
+            "retention_dependency_failure",
+        );
+        assert_eq!(deleted.load(Ordering::Relaxed), calls);
+        let mut tx = fixture.runtime.begin_worker().await.unwrap();
+        let row = &tx
+            .query(
+                "SELECT a.retained_until = '-infinity'::timestamptz,
+                        retry.next_attempt_at > CURRENT_TIMESTAMP,
+                        NOT EXISTS (SELECT 1 FROM dq_runs WHERE run_id = $3)
+                 FROM dq_artifacts a CROSS JOIN work_leases retry
+                 WHERE a.artifact_id = $1 AND retry.resource_type = 'dq-artifact-retention'
+                   AND retry.resource_id = $2",
+                &[&artifact, &retry_id, &later_run],
+            )
+            .await
+            .unwrap()[0];
+        assert!(row.get::<_, bool>(0), "failed claims stay durable");
+        assert!(row.get::<_, bool>(1), "failed claims are deferred");
+        assert!(
+            row.get::<_, bool>(2),
+            "later artifacts and metadata are collected"
+        );
+        tx.commit().await.unwrap();
+        store.collect_retention(&artifacts, &config).await.unwrap();
+        assert_eq!(deleted.load(Ordering::Relaxed), calls);
+        let mut tx = fixture.runtime.begin_worker().await.unwrap();
+        tx.execute(
+            "UPDATE work_leases SET next_attempt_at = CURRENT_TIMESTAMP
+             WHERE resource_type = 'dq-artifact-retention' AND resource_id = $1",
+            &[&retry_id],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
     store.collect_retention(&artifacts, &config).await.unwrap();
     server.abort();
+    assert_eq!(deleted.load(Ordering::Relaxed), 3);
     let mut tx = fixture.runtime.begin_worker().await.unwrap();
     assert!(tx
         .query(
@@ -562,13 +742,14 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
         .await
         .unwrap()
         .is_empty());
-    let invalid_claim: bool = tx
-        .query("SELECT retained_until = '-infinity'::timestamptz FROM dq_artifacts WHERE artifact_id=$1",
-               &[&invalid_id])
+    assert!(tx
+        .query(
+            "SELECT 1 FROM dq_artifacts WHERE artifact_id=$1",
+            &[&invalid_id],
+        )
         .await
-        .unwrap()[0]
-        .get(0);
-    assert!(invalid_claim);
+        .unwrap()
+        .is_empty());
     tx.commit().await.unwrap();
     assert_eq!(
         store.artifact(&principal, other, false).await.unwrap(),
@@ -674,4 +855,234 @@ async fn retention_collects_valid_artifact_behind_a_full_page_of_invalid_claims(
     assert_eq!(rows[0].get::<_, i64>("total"), 100);
     assert_eq!(rows[0].get::<_, i64>("claimed"), 100);
     tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn retention_keeps_terminal_runs_that_share_open_review_evidence() {
+    use octopus::{config::ArchiveConfig, dq_runtime::DqArtifacts};
+
+    let Some(fixture) = support::Fixture::start().await else {
+        return;
+    };
+    let store = DqStore::new(fixture.runtime.clone(), settings());
+    store.reconcile_policies().await.unwrap();
+    let principal = actor();
+    store.register(&principal, &manifest()).await.unwrap();
+    let owner = store
+        .admit(&principal, &request("shared-owner"))
+        .await
+        .unwrap();
+    let holder = store
+        .admit(&principal, &request("shared-review"))
+        .await
+        .unwrap();
+    let owner = owner["run_id"].as_str().unwrap();
+    let holder = holder["run_id"].as_str().unwrap();
+    let input = reference(owner, None);
+    let artifact = input["artifact_id"].as_str().unwrap();
+    let mut alias = input.clone();
+    alias["artifact_id"] = json!("legacy-shared-id");
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    tx.execute(
+        "INSERT INTO merge_candidates (candidate_id, mac_a, mac_b, projection_run_id, status)
+         VALUES ('shared-review', '00:11:22:33:44:55', '00:11:22:33:44:66', 'test', 'pending')",
+        &[],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE dq_runs SET status='succeeded', completed_at=CURRENT_TIMESTAMP - INTERVAL '92 days'
+         WHERE run_id IN ($1,$2)",
+        &[&owner, &holder],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE dq_runs SET projection_applied=true,
+            summary='{\"review_candidate_ids\":[\"shared-review\"]}', input_refs=$2 WHERE run_id=$1",
+        &[&holder, &json!([alias])],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO dq_artifacts
+           (artifact_id,run_id,reference,installation_id,namespace,closed_at,retained_until)
+         SELECT $2,run_id,$3,installation_id,namespace,completed_at,completed_at + INTERVAL '90 days'
+         FROM dq_runs WHERE run_id=$1",
+        &[&owner, &artifact, &input],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE dq_outbox SET status='published', published_at=CURRENT_TIMESTAMP WHERE payload->>'run_id'=$1",
+        &[&holder],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let config = config();
+    let archive = ArchiveConfig {
+        endpoint: "http://127.0.0.1:0".into(),
+        access_key: "test-key".into(),
+        secret_key: "test-secret".into(),
+        ..ArchiveConfig::default()
+    };
+    let artifacts = DqArtifacts::new(config.clone(), &archive).unwrap();
+    assert_eq!(store.retention_batch(&artifacts, &config).await.unwrap(), 0);
+    assert!(store.get_run(&principal, holder).await.is_ok());
+
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    tx.execute(
+        "UPDATE merge_candidates SET status='confirmed', updated_at=CURRENT_TIMESTAMP - INTERVAL '91 days'
+         WHERE candidate_id='shared-review'",
+        &[],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(store.retention_batch(&artifacts, &config).await.unwrap(), 1);
+    code(store.get_run(&principal, holder).await, "run_not_found");
+}
+
+#[tokio::test]
+async fn retention_rechecks_eligibility_after_a_concurrent_review_reopens() {
+    use octopus::{config::ArchiveConfig, dq_runtime::DqArtifacts};
+    use std::time::Duration;
+
+    let Some(fixture) = support::Fixture::start().await else {
+        return;
+    };
+    let store = DqStore::new(fixture.runtime.clone(), settings());
+    store.reconcile_policies().await.unwrap();
+    let principal = actor();
+    store.register(&principal, &manifest()).await.unwrap();
+    let run = store
+        .admit(&principal, &request("retention-concurrent-review"))
+        .await
+        .unwrap();
+    let run_id = run["run_id"].as_str().unwrap();
+    let input = reference(run_id, None);
+    let artifact = input["artifact_id"].as_str().unwrap();
+    let other = store
+        .admit(&principal, &request("retention-unlocked"))
+        .await
+        .unwrap();
+    let other = other["run_id"].as_str().unwrap();
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    tx.execute(
+        "INSERT INTO merge_candidates (candidate_id, mac_a, mac_b, projection_run_id, status, updated_at)
+         VALUES ('retention-review', '00:11:22:33:44:55', '00:11:22:33:44:66', 'test',
+                 'confirmed', CURRENT_TIMESTAMP - INTERVAL '92 days')",
+        &[],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE dq_runs SET status='succeeded', completed_at=CURRENT_TIMESTAMP - INTERVAL '91 days',
+          projection_applied=true, summary='{\"review_candidate_ids\":[\"retention-review\"]}', input_refs=$2
+         WHERE run_id=$1",
+        &[&run_id, &json!([input])],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO dq_artifacts
+           (artifact_id, run_id, reference, installation_id, namespace, closed_at, retained_until)
+         SELECT $2, run_id, $3, installation_id, namespace, completed_at, completed_at + INTERVAL '90 days'
+         FROM dq_runs WHERE run_id=$1",
+        &[&run_id, &artifact, &input],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE dq_runs SET status='succeeded', completed_at=CURRENT_TIMESTAMP - INTERVAL '91 days'
+         WHERE run_id=$1",
+        &[&other],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO dq_artifacts
+           (artifact_id,run_id,reference,installation_id,namespace,closed_at,retained_until)
+         SELECT 'retention-unlocked',run_id,'{\"uri\":\"invalid\",\"version_id\":\"v1\"}',
+                installation_id,namespace,completed_at,completed_at + INTERVAL '90 days'
+         FROM dq_runs WHERE run_id=$1",
+        &[&other],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut review = fixture.runtime.begin_worker().await.unwrap();
+    let pid: i32 = review.query("SELECT pg_backend_pid()", &[]).await.unwrap()[0].get(0);
+    review
+        .execute(
+            "UPDATE merge_candidates SET status='pending', updated_at=CURRENT_TIMESTAMP
+             WHERE candidate_id='retention-review'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let config = DqConfig {
+        artifact_bucket: "dq-artifacts".into(),
+        ..config()
+    };
+    let archive = ArchiveConfig {
+        endpoint: "http://127.0.0.1:0".into(),
+        access_key: "test-key".into(),
+        secret_key: "test-secret".into(),
+        ..ArchiveConfig::default()
+    };
+    let artifacts = DqArtifacts::new(config.clone(), &archive).unwrap();
+    // Keep the review lock held through a full page. The unrelated artifact
+    // must still be processed, and the locked artifact remains unclaimed.
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            store.retention_batch(&artifacts, &config)
+        )
+        .await
+        .expect("the review lock wait must be bounded")
+        .unwrap(),
+        1,
+    );
+    assert_eq!(
+        store.artifact(&principal, artifact, false).await.unwrap(),
+        input,
+    );
+    let collect = {
+        let store = store.clone();
+        tokio::spawn(async move { store.collect_retention(&artifacts, &config).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut observer = fixture.runtime.begin_worker().await.unwrap();
+            let blocked: bool = observer
+                .query(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY (pg_blocking_pids(pid)))",
+                    &[&pid],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            observer.commit().await.unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("collector must wait for the review before claiming the artifact");
+    review.commit().await.unwrap();
+    collect.await.unwrap().unwrap();
+    assert_eq!(
+        store.artifact(&principal, artifact, false).await.unwrap(),
+        input,
+    );
+    assert_eq!(
+        store.get_run(&principal, run_id).await.unwrap()["input_refs"],
+        json!([input]),
+    );
 }

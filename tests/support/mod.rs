@@ -41,16 +41,22 @@ impl Drop for Fixture {
 
 impl Fixture {
     pub async fn start() -> Option<Self> {
+        let required = std::env::var("OCTOPUS_REQUIRE_DOCKER").as_deref() == Ok("true");
+        Self::start_with_policy(required).await
+    }
+
+    pub async fn start_required() -> Option<Self> {
+        let required = std::env::var("OCTOPUS_REQUIRE_DOCKER").as_deref() != Ok("false");
+        Self::start_with_policy(required).await
+    }
+
+    async fn start_with_policy(required: bool) -> Option<Self> {
         if !Command::new("docker")
             .arg("info")
             .output()
             .is_ok_and(|out| out.status.success())
         {
-            assert_ne!(
-                std::env::var("OCTOPUS_REQUIRE_DOCKER").as_deref(),
-                Ok("true"),
-                "required Docker is unavailable"
-            );
+            assert!(!required, "required Docker is unavailable");
             eprintln!("Docker unavailable; canonical PostgreSQL integration was not exercised");
             return None;
         }

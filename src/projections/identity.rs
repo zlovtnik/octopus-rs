@@ -39,16 +39,23 @@ async fn reconcile(
     ids: Option<Vec<String>>,
 ) -> Result<i32, ProjectionError> {
     tx.query(&format!("SELECT candidate.candidate_id FROM atheros_search.merge_candidates candidate WHERE {RECONCILE_PREDICATE} ORDER BY candidate.candidate_id FOR UPDATE OF candidate"),&[&ids]).await?;
+    // Use the latest similarity for pending candidates. Legacy rows carry only confidence.
     let statement=format!("WITH classified AS (SELECT candidate.candidate_id,
         CASE WHEN decision.decision='merge' THEN 'confirmed' WHEN decision.candidate_id IS NOT NULL THEN decision.decision
-          WHEN candidate.confidence >= $2 AND left_device.registered AND right_device.registered
-            AND left_device.registered_device_id IS NOT NULL AND left_device.registered_device_id=right_device.registered_device_id THEN 'confirmed' ELSE 'pending' END AS next_status,
-        CASE WHEN decision.decision='merge' THEN 'human' WHEN decision.candidate_id IS NULL AND candidate.confidence >= $2 AND left_device.registered AND right_device.registered AND left_device.registered_device_id IS NOT NULL AND left_device.registered_device_id=right_device.registered_device_id THEN 'automatic' ELSE NULL END AS next_source,
-        CASE WHEN decision.candidate_id IS NULL AND candidate.confidence >= $2 AND left_device.registered AND right_device.registered AND left_device.registered_device_id IS NOT NULL AND left_device.registered_device_id=right_device.registered_device_id THEN left_device.registered_device_id ELSE NULL END AS next_registered_device_id
+          WHEN automatic.eligible THEN 'confirmed' ELSE 'pending' END AS next_status,
+        CASE WHEN decision.decision='merge' THEN 'human' WHEN automatic.eligible THEN 'automatic' END AS next_source,
+        CASE WHEN automatic.eligible THEN left_device.registered_device_id END AS next_registered_device_id
         FROM atheros_search.merge_candidates candidate
         LEFT JOIN atheros_search.merge_decisions decision ON decision.candidate_id=candidate.candidate_id
         LEFT JOIN atheros_search.devices left_device ON left_device.mac=candidate.mac_a
         LEFT JOIN atheros_search.devices right_device ON right_device.mac=candidate.mac_b
+        CROSS JOIN LATERAL (SELECT decision.candidate_id IS NULL AND candidate.confidence >= $2
+          AND (candidate.confirmation_source='automatic'
+            OR jsonb_typeof(candidate.evidence->'latest_similarity') IS DISTINCT FROM 'number'
+            OR candidate.evidence->'latest_similarity' >= to_jsonb($2::double precision))
+          AND left_device.registered AND right_device.registered
+          AND left_device.registered_device_id IS NOT NULL
+          AND left_device.registered_device_id=right_device.registered_device_id AS eligible) automatic
         WHERE {RECONCILE_PREDICATE})
         UPDATE atheros_search.merge_candidates candidate SET status=classified.next_status,confirmation_source=classified.next_source,
         trusted_registered_device_id=classified.next_registered_device_id,
@@ -151,7 +158,11 @@ impl ProjectionStore {
         let edges = tx
             .query(
                 q::SELECT_SIMILARITY_EDGES,
-                &[&minimum_similarity.clamp(-1.0, 1.0), &limit.max(1)],
+                &[
+                    &minimum_similarity.clamp(-1.0, 1.0),
+                    &limit.max(1),
+                    &AUTOMATIC_MERGE_SIMILARITY,
+                ],
             )
             .await?;
         let mut seen = BTreeSet::new();

@@ -534,23 +534,92 @@ pub(super) const UPSERT_ROAMING_EDGES: &str = paged_observation_edges!(
 );
 
 // Parameters: 1=projectionRunId, 2=batchLimit
-pub(super) const UPSERT_SAME_CHANNEL_EDGES: &str = paged_observation_edges!(
-    "graph-same-channel",
-    "$2::int",
-    r#"SELECT DISTINCT ''::text AS shared_key, frame.source_mac
-       FROM wireless_frames frame
-       JOIN wireless_frame_radio radio USING (dedupe_key)
-       JOIN atheros_search.graph_nodes node ON node.node_id = CONCAT('device:', frame.source_mac)
-       WHERE frame.source_mac IS NOT NULL
-         AND (radio.channel_number IS NOT NULL OR radio.frequency_mhz IS NOT NULL)"#,
-    r#", observations AS MATERIALIZED (
+// Seek qualifying right devices one left device at a time and stop at a full
+// page. Combine overlapping time windows before looking up right-hand frames.
+pub(super) const UPSERT_SAME_CHANNEL_EDGES: &str = r#"WITH RECURSIVE cursor AS MATERIALIZED (
+                                SELECT checkpoint_value::jsonb AS position
+                                FROM octopus_core.processor_checkpoints
+                                WHERE processor_name = 'wireless-identity-projector' AND shard_id = 'graph-same-channel'
+                              ), radio_members AS MATERIALIZED (
+                                SELECT DISTINCT frame.source_mac, radio.frequency_mhz, radio.channel_number
+                                FROM wireless_frames frame
+                                JOIN wireless_frame_radio radio USING (dedupe_key)
+                                JOIN atheros_search.graph_nodes node ON node.node_id = CONCAT('device:', frame.source_mac)
+                                WHERE frame.source_mac IS NOT NULL
+                                  AND (radio.channel_number IS NOT NULL OR radio.frequency_mhz IS NOT NULL)
+                              ), shared_frequencies AS (
+                                SELECT frequency_mhz FROM radio_members
+                                WHERE frequency_mhz IS NOT NULL
+                                GROUP BY frequency_mhz HAVING MIN(source_mac) <> MAX(source_mac)
+                              ), shared_channels AS (
+                                SELECT channel_number FROM radio_members
+                                WHERE channel_number IS NOT NULL
+                                GROUP BY channel_number
+                                HAVING MIN(source_mac) <> MAX(source_mac) AND BOOL_OR(frequency_mhz IS NULL)
+                              ), sources AS MATERIALIZED (
+                                SELECT cursor.position, ARRAY(
+                                  SELECT DISTINCT member.source_mac::text
+                                  FROM radio_members member
+                                  LEFT JOIN shared_frequencies frequency USING (frequency_mhz)
+                                  LEFT JOIN shared_channels channel USING (channel_number)
+                                  WHERE (frequency.frequency_mhz IS NOT NULL OR channel.channel_number IS NOT NULL)
+                                    AND (cursor.position IS NULL OR member.source_mac >= cursor.position->>1)
+                                  ORDER BY 1
+                                ) AS macs
+                                FROM (VALUES (1)) seed LEFT JOIN cursor ON TRUE
+                              ), pages(left_index, remaining, right_macs) AS (
+                                SELECT 0, $2::int, ARRAY[]::text[]
+                                UNION ALL
+                                SELECT pages.left_index + 1, pages.remaining - cardinality(matches.macs), matches.macs
+                                FROM pages CROSS JOIN sources
+                                CROSS JOIN LATERAL (SELECT sources.macs[pages.left_index + 1]) left_member(left_mac)
+                                CROSS JOIN LATERAL (SELECT ARRAY(
+                                  SELECT DISTINCT right_frame.source_mac::text
+                                  FROM (
+                                    SELECT radio.frequency_mhz, radio.channel_number,
+                                           range_agg(tstzrange(frame.observed_at - INTERVAL '10 minutes',
+                                                              frame.observed_at + INTERVAL '10 minutes', '[]')) AS windows
+                                    FROM wireless_frames frame JOIN wireless_frame_radio radio USING (dedupe_key)
+                                    WHERE frame.source_mac = left_member.left_mac
+                                      AND (radio.channel_number IS NOT NULL OR radio.frequency_mhz IS NOT NULL)
+                                    GROUP BY radio.frequency_mhz, radio.channel_number
+                                  ) left_radio
+                                  CROSS JOIN LATERAL unnest(left_radio.windows) AS windows(span)
+                                  JOIN wireless_frames right_frame
+                                    ON right_frame.observed_at BETWEEN lower(windows.span) AND upper(windows.span)
+                                   AND right_frame.source_mac > CASE WHEN left_member.left_mac = sources.position->>1
+                                                                     THEN sources.position->>2 ELSE left_member.left_mac END
+                                  JOIN wireless_frame_radio right_radio ON right_radio.dedupe_key = right_frame.dedupe_key
+                                  JOIN atheros_search.graph_nodes node ON node.node_id = CONCAT('device:', right_frame.source_mac)
+                                  WHERE left_radio.frequency_mhz = right_radio.frequency_mhz
+                                     OR ((left_radio.frequency_mhz IS NULL OR right_radio.frequency_mhz IS NULL)
+                                         AND left_radio.channel_number = right_radio.channel_number)
+                                  ORDER BY 1
+                                  LIMIT pages.remaining
+                                )) matches(macs)
+                                WHERE pages.remaining > 0 AND pages.left_index < cardinality(sources.macs) - 1
+                              ), candidate_pairs AS MATERIALIZED (
+                                SELECT sources.macs[pages.left_index] AS left_mac, right_mac
+                                FROM pages CROSS JOIN sources CROSS JOIN LATERAL unnest(pages.right_macs) right_mac
+                              ), saved_position AS (
+                                INSERT INTO octopus_core.processor_checkpoints AS checkpoint
+                                  (processor_name, shard_id, checkpoint_value)
+                                VALUES ('wireless-identity-projector', 'graph-same-channel', (
+                                  SELECT jsonb_build_array('', left_mac, right_mac)::text FROM candidate_pairs
+                                  WHERE EXISTS (SELECT 1 FROM pages WHERE remaining = 0)
+                                  ORDER BY left_mac DESC, right_mac DESC LIMIT 1
+                                ))
+                                ON CONFLICT (processor_name, shard_id) DO UPDATE SET
+                                  checkpoint_value = EXCLUDED.checkpoint_value, updated_at = CURRENT_TIMESTAMP
+                                WHERE checkpoint.checkpoint_value IS DISTINCT FROM EXCLUDED.checkpoint_value
+                              ), observations AS MATERIALIZED (
                                 SELECT frame.source_mac, radio.channel_number, radio.frequency_mhz,
                                        range_agg(tstzrange(frame.observed_at, frame.observed_at, '[]')) AS observed_times,
                                        range_agg(tstzrange(frame.observed_at - INTERVAL '10 minutes',
                                                           frame.observed_at + INTERVAL '10 minutes', '[]')) AS overlap_windows
                                 FROM wireless_frames frame
                                      JOIN wireless_frame_radio radio USING (dedupe_key)
-                                JOIN (SELECT left_mac AS mac FROM page UNION SELECT right_mac FROM page) source
+                                JOIN (SELECT left_mac AS mac FROM candidate_pairs UNION SELECT right_mac FROM candidate_pairs) source
                                   ON source.mac = frame.source_mac
                                 WHERE radio.channel_number IS NOT NULL OR radio.frequency_mhz IS NOT NULL
                                 GROUP BY frame.source_mac, radio.channel_number, radio.frequency_mhz
@@ -655,8 +724,7 @@ pub(super) const UPSERT_SAME_CHANNEL_EDGES: &str = paged_observation_edges!(
                                     COALESCE(graph_edges.observed_at, EXCLUDED.observed_at),
                                     COALESCE(EXCLUDED.observed_at, graph_edges.observed_at)
                                   ),
-                                  updated_at = CURRENT_TIMESTAMP"#
-);
+                                  updated_at = CURRENT_TIMESTAMP"#;
 
 // Parameters: 1=projectionRunId, 2=batchLimit
 pub(super) const UPSERT_VENDOR_LINK_EDGES: &str = paged_observation_edges!(
@@ -751,8 +819,13 @@ pub(super) const UPSERT_ACCESS_POINT_CATALOG: &str = r#"WITH observed AS (
 
 // Radio backfill touches the parent frame's updated_at in the same transaction.
 // Parameters: 1=batchLimit
-pub(super) const UPSERT_WIRELESS_SIGNAL_SUMMARIES: &str = r#"WITH candidates AS MATERIALIZED (
-                                 SELECT bucket.window_start, bucket.sensor_id, bucket.bssid, bucket.source_mac
+pub(super) const UPSERT_WIRELESS_SIGNAL_SUMMARIES: &str = r#"WITH ranked AS (
+                                 SELECT bucket.window_start, bucket.sensor_id, bucket.bssid, bucket.source_mac,
+                                        work.kind, ROW_NUMBER() OVER (
+                                          PARTITION BY work.kind
+                                          ORDER BY existing.projected_at ASC, bucket.bucket_updated_at DESC,
+                                                   bucket.window_start, bucket.sensor_id, bucket.bssid, bucket.source_mac
+                                        ) AS work_rank
                                  FROM (
                                    SELECT date_trunc('hour', frame.observed_at)
                                             + floor(EXTRACT(minute FROM frame.observed_at) / 5) * INTERVAL '5 minutes'
@@ -780,14 +853,31 @@ pub(super) const UPSERT_WIRELESS_SIGNAL_SUMMARIES: &str = r#"WITH candidates AS 
                                        OR existing.last_observed_at IS DISTINCT FROM bucket.last_observed_at
                                        OR existing.projected_at < bucket.bucket_updated_at AS stale
                                  ) state
+                                 CROSS JOIN LATERAL (SELECT CASE
+                                   WHEN existing.window_start IS NULL THEN 'new'
+                                   WHEN state.stale THEN 'repair'
+                                   ELSE 'refresh' END AS kind) work
                                  WHERE GREATEST(bucket.last_observed_at, bucket.bucket_updated_at)
                                          >= CURRENT_TIMESTAMP - INTERVAL '7 days'
                                     OR (existing.window_start IS NOT NULL AND state.stale)
-                                 ORDER BY state.stale DESC,
-                                          COALESCE(existing.projected_at, TIMESTAMPTZ 'epoch') ASC,
-                                          bucket.bucket_updated_at DESC, bucket.window_start,
-                                          bucket.sensor_id, bucket.bssid, bucket.source_mac
+                               ), candidates AS MATERIALIZED (
+                                 SELECT * FROM ranked
+                                 ORDER BY (kind = 'refresh'), work_rank,
+                                          (kind = CASE WHEN $1::int = 1 THEN COALESCE((
+                                             SELECT checkpoint_value FROM octopus_core.processor_checkpoints
+                                             WHERE processor_name = 'wireless-identity-projector'
+                                               AND shard_id = 'signal-summary-single-slot'
+                                           ), 'new') ELSE 'new' END)
                                  LIMIT $1::int
+                               ), saved_choice AS (
+                                 -- A one-slot batch alternates when both queues have work.
+                                 INSERT INTO octopus_core.processor_checkpoints AS checkpoint
+                                   (processor_name, shard_id, checkpoint_value)
+                                 SELECT 'wireless-identity-projector', 'signal-summary-single-slot', kind
+                                 FROM candidates WHERE $1::int = 1 AND kind <> 'refresh'
+                                 ON CONFLICT (processor_name, shard_id) DO UPDATE SET
+                                   checkpoint_value = EXCLUDED.checkpoint_value, updated_at = CURRENT_TIMESTAMP
+                                 WHERE checkpoint.checkpoint_value IS DISTINCT FROM EXCLUDED.checkpoint_value
                                )
                                INSERT INTO atheros_search.wireless_signal_summaries (
                                  window_start, sensor_id, location_id, bssid, source_mac,

@@ -16,6 +16,16 @@ pub async fn persist_merge_candidate(
     right: &str,
     confidence: f64,
 ) -> Result<String, ProjectionError> {
+    persist_merge_candidate_evidence(tx, left, right, confidence, None).await
+}
+
+async fn persist_merge_candidate_evidence(
+    tx: &mut PgTransaction,
+    left: &str,
+    right: &str,
+    confidence: f64,
+    evidence_at: Option<DateTime<Utc>>,
+) -> Result<String, ProjectionError> {
     if !confidence.is_finite() {
         return Err(ProjectionError::Invalid("nonfinite identity confidence"));
     }
@@ -29,7 +39,14 @@ pub async fn persist_merge_candidate(
     let rows = tx
         .query(
             q::UPSERT_MERGE_CANDIDATE,
-            &[&id, &left, &right, &confidence.clamp(0.0, 1.0), &run],
+            &[
+                &id,
+                &left,
+                &right,
+                &confidence.clamp(0.0, 1.0),
+                &run,
+                &evidence_at,
+            ],
         )
         .await?;
     Ok(rows[0].get(0))
@@ -155,6 +172,7 @@ impl ProjectionStore {
             return Err(ProjectionError::Invalid("nonfinite similarity threshold"));
         }
         let mut tx = self.runtime.begin_worker().await?;
+        lock_identity_clusters(&mut tx).await?;
         let edges = tx
             .query(
                 q::SELECT_SIMILARITY_EDGES,
@@ -165,20 +183,12 @@ impl ProjectionStore {
                 ],
             )
             .await?;
-        let mut seen = BTreeSet::new();
-        let mut total = 0;
+        let total = edges.len() as i32;
         for row in edges {
             let left: String = row.get(0);
             let right: String = row.get(1);
-            let pair = if left <= right {
-                (left, right)
-            } else {
-                (right, left)
-            };
-            if seen.insert(pair.clone()) {
-                persist_merge_candidate(&mut tx, &pair.0, &pair.1, row.get(2)).await?;
-                total += 1;
-            }
+            persist_merge_candidate_evidence(&mut tx, &left, &right, row.get(2), Some(row.get(3)))
+                .await?;
         }
         tx.commit().await?;
         Ok(total)

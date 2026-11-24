@@ -85,7 +85,7 @@ async fn fresh_similarity_reopens_an_expired_reverse_candidate_without_reusing_i
              right_source_mac,cosine_distance,cosine_similarity,evidence,computed_at,projection_run_id)
          SELECT gen_random_uuid(),'device_device','test','device',a.document_id,b.document_id,
                 a.source_table,a.source_key,a.source_key,b.source_table,b.source_key,b.source_key,
-                0.2,0.8,'{}',CURRENT_TIMESTAMP,gen_random_uuid()
+                0.2,0.8,'{}',CURRENT_TIMESTAMP-INTERVAL '2 days',gen_random_uuid()
          FROM atheros_search.search_documents a CROSS JOIN atheros_search.search_documents b
          WHERE a.source_key='aa:bb:cc:dd:ee:02' AND b.source_key='aa:bb:cc:dd:ee:04';",
     );
@@ -112,11 +112,56 @@ async fn fresh_similarity_reopens_an_expired_reverse_candidate_without_reusing_i
 
     fixture.admin(
         "UPDATE atheros_search.similarity_pairs
-         SET cosine_similarity=0.99,cosine_distance=0.01,computed_at=clock_timestamp()",
+         SET cosine_similarity=0.99,cosine_distance=0.01,computed_at=computed_at+INTERVAL '1 day'",
     );
     assert_eq!(store.project_cluster_candidates(1, 0.5).await.unwrap(), 1);
     assert_eq!(store.project_cluster_candidates(1, 0.5).await.unwrap(), 0);
     assert!(store.project_approved_identities(1).await.unwrap() > 0);
+}
+
+#[tokio::test]
+async fn similarity_paging_uses_latest_evidence_across_pair_orientations() {
+    let Some(fixture) = support::Fixture::start_required().await else {
+        return;
+    };
+    fixture.admin(
+        "INSERT INTO atheros_search.search_documents(
+             document_id,source_kind,source_id,source_key,source_table,normalized_text,normalized_sha256)
+         SELECT gen_random_uuid(),'device',mac,mac,'inventory_devices','text',repeat('a',64)
+         FROM (VALUES ('aa:bb:cc:dd:ee:02'),('aa:bb:cc:dd:ee:04'),('aa:bb:cc:dd:ee:06')) device(mac);
+         INSERT INTO atheros_search.similarity_pairs(
+             pair_id,pair_kind,embedding_model,embedding_kind,left_document_id,right_document_id,
+             left_source_table,left_source_key,left_source_mac,right_source_table,right_source_key,
+             right_source_mac,cosine_distance,cosine_similarity,evidence,computed_at,projection_run_id)
+         SELECT gen_random_uuid(),'device_device',model,'device',a.document_id,b.document_id,
+                a.source_table,a.source_key,a.source_key,b.source_table,b.source_key,b.source_key,
+                1-similarity,similarity,'{}',CURRENT_TIMESTAMP-age,gen_random_uuid()
+         FROM (VALUES ('older-low','02','04',0.80,INTERVAL '4 days'),
+                      ('newer-high','04','02',0.99,INTERVAL '3 days'),
+                      ('older-high','02','06',0.99,INTERVAL '4 days'),
+                      ('newer-low','06','02',0.80,INTERVAL '3 days')) scores(model,left_mac,right_mac,similarity,age)
+         JOIN atheros_search.search_documents a ON a.source_key='aa:bb:cc:dd:ee:' || left_mac
+         JOIN atheros_search.search_documents b ON b.source_key='aa:bb:cc:dd:ee:' || right_mac",
+    );
+    let store = ProjectionStore::new(fixture.runtime.clone());
+    assert_eq!(store.project_cluster_candidates(2, 0.5).await.unwrap(), 2);
+    let mut tx = fixture.runtime.begin_worker().await.unwrap();
+    let rows = tx
+        .query(
+            "SELECT mac_a, mac_b, confidence FROM atheros_search.merge_candidates ORDER BY mac_b",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, String>(0), "aa:bb:cc:dd:ee:02");
+    assert_eq!(rows[0].get::<_, String>(1), "aa:bb:cc:dd:ee:04");
+    assert_eq!(rows[0].get::<_, f64>(2), 0.99);
+    assert_eq!(rows[1].get::<_, String>(1), "aa:bb:cc:dd:ee:06");
+    assert_eq!(rows[1].get::<_, f64>(2), 0.80);
+    tx.commit().await.unwrap();
+
+    fixture.admin("DELETE FROM atheros_search.similarity_pairs WHERE embedding_model='newer-low'");
+    assert_eq!(store.project_cluster_candidates(2, 0.5).await.unwrap(), 0);
 }
 
 async fn reversed_candidate_refresh(legacy_id: Option<&str>) {

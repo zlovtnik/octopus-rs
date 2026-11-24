@@ -929,6 +929,43 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn delete_only_accepts_missing_version_body_for_versioned_404() {
+        use axum::{routing::delete, Router};
+
+        const BODY: &str = "<Error><Code>NoSuchVersion</Code><VersionId>v1</VersionId></Error>";
+        let router = Router::new()
+            .route(
+                "/bucket/missing",
+                delete(|| async { (StatusCode::NOT_FOUND, BODY) }),
+            )
+            .route(
+                "/bucket/error",
+                delete(|| async { (StatusCode::INTERNAL_SERVER_ERROR, BODY) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let store = MinioStore::new(&endpoint, "key", "secret", "us-east-1", "bucket").unwrap();
+
+        store.delete("missing", Some("v1")).await.unwrap();
+        assert!(matches!(
+            store.delete("error", Some("v1")).await,
+            Err(ArchiveError::Storage {
+                status: Some(500),
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.delete("missing", None).await,
+            Err(ArchiveError::Storage {
+                status: Some(404),
+                ..
+            })
+        ));
+        server.abort();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn real_minio_exact_version_integrity_and_presigned_access() {
         use std::process::Command;

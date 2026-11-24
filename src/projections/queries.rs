@@ -3,7 +3,9 @@
 // Parameters: 1=minimumSimilarity .max(-1.0d) .min(1.0d), 2=limit.max(1), 3=AutomaticMergeSimilarity
 // Expired pending candidates can be reconsidered when newer evidence arrives.
 // A qualifying newer score can also replace a below-threshold refresh of a pending candidate.
-pub const SELECT_SIMILARITY_EDGES: &str = r#"SELECT left_source_mac, right_source_mac, cosine_similarity
+pub const SELECT_SIMILARITY_EDGES: &str = r#"WITH latest AS (
+           SELECT DISTINCT ON (left_mac, right_mac) left_mac, right_mac,
+                  pair.cosine_similarity, pair.computed_at, pair.pair_id
            FROM atheros_search.similarity_pairs pair
            JOIN atheros_search.search_documents left_document
              ON left_document.document_id = pair.left_document_id
@@ -11,11 +13,14 @@ pub const SELECT_SIMILARITY_EDGES: &str = r#"SELECT left_source_mac, right_sourc
            JOIN atheros_search.search_documents right_document
              ON right_document.document_id = pair.right_document_id
             AND right_document.status = 'active'
+           CROSS JOIN LATERAL (SELECT
+             LEAST(pair.left_source_mac COLLATE "C", pair.right_source_mac COLLATE "C") AS left_mac,
+             GREATEST(pair.left_source_mac COLLATE "C", pair.right_source_mac COLLATE "C") AS right_mac
+           ) normalized
            WHERE pair.pair_kind = 'device_device'
              AND pair.left_source_mac IS NOT NULL
              AND pair.right_source_mac IS NOT NULL
              AND pair.left_source_mac <> pair.right_source_mac
-             AND pair.cosine_similarity >= $1
              AND NOT EXISTS (
                SELECT 1 FROM octopus_core.dq_scope_policies policy
                WHERE policy.mode = 'enabled' AND (policy.authorized_scope = '*' OR (
@@ -25,19 +30,28 @@ pub const SELECT_SIMILARITY_EDGES: &str = r#"SELECT left_source_mac, right_sourc
                          WHERE device.mac = pair.right_source_mac AND device.location_id = policy.authorized_scope)
                ))
              )
+           ORDER BY left_mac, right_mac, pair.computed_at DESC, pair.pair_id DESC
+           )
+           SELECT left_mac, right_mac, cosine_similarity, computed_at
+           FROM latest pair
+           WHERE pair.cosine_similarity >= $1
              AND NOT COALESCE((
-               SELECT candidate.confidence >= pair.cosine_similarity
+               SELECT COALESCE(decision.candidate_id IS NULL AND candidate.status = 'pending'
+                         AND evidence.computed_at > pair.computed_at, FALSE)
+                 OR (candidate.confidence >= pair.cosine_similarity
                  AND NOT COALESCE(decision.candidate_id IS NULL AND candidate.status = 'pending'
-                       AND candidate.computed_at < pair.computed_at AND pair.cosine_similarity >= $3
+                       AND COALESCE(evidence.computed_at, candidate.computed_at) < pair.computed_at
+                       AND pair.cosine_similarity >= $3
                        AND jsonb_typeof(candidate.evidence->'latest_similarity') = 'number'
-                       AND candidate.evidence->'latest_similarity' < to_jsonb($3::double precision), FALSE)
+                       AND candidate.evidence->'latest_similarity' < to_jsonb($3::double precision), FALSE))
                FROM atheros_search.merge_candidates candidate
                LEFT JOIN atheros_search.merge_decisions decision USING (candidate_id)
-               WHERE ((candidate.mac_a = pair.left_source_mac AND candidate.mac_b = pair.right_source_mac)
-                   OR (candidate.mac_a = pair.right_source_mac AND candidate.mac_b = pair.left_source_mac))
+               CROSS JOIN LATERAL (SELECT (candidate.evidence->>'latest_similarity_at')::timestamptz) evidence(computed_at)
+               WHERE ((candidate.mac_a = pair.left_mac AND candidate.mac_b = pair.right_mac)
+                   OR (candidate.mac_a = pair.right_mac AND candidate.mac_b = pair.left_mac))
                  AND (decision.candidate_id IS NOT NULL OR candidate.status <> 'pending'
                       OR candidate.expires_at IS NULL OR candidate.expires_at > CURRENT_TIMESTAMP
-                      OR candidate.computed_at >= pair.computed_at)
+                      OR COALESCE(evidence.computed_at, candidate.computed_at) >= pair.computed_at)
                ORDER BY (decision.candidate_id IS NOT NULL) DESC,
                         (candidate.mac_a COLLATE "C" > candidate.mac_b COLLATE "C") DESC
                LIMIT 1
@@ -88,14 +102,14 @@ pub const SELECT_APPROVED_IDENTITY_EDGES: &str = r#"SELECT candidate.mac_a, cand
              )
            ORDER BY candidate.confirmed_at, candidate.candidate_id"#;
 
-// Parameters: 1=candidateId, 2=ordered.head, 3=ordered.last, 4=confidence .max(0.0d) .min(1.0d), 5=runId
+// Parameters: 1=candidateId, 2=ordered.head, 3=ordered.last, 4=confidence, 5=runId, 6=similarity evidence timestamp
 // Both queries prefer a human decision and fall back to the legacy reverse row.
 pub const UPSERT_MERGE_CANDIDATE: &str = r#"WITH refreshed AS (
              UPDATE atheros_search.merge_candidates SET
                confidence = GREATEST(confidence, $4),
                evidence = (CASE WHEN jsonb_typeof(evidence) = 'object' THEN evidence
                                 ELSE jsonb_build_object('legacy_evidence', evidence) END)
-                          || jsonb_build_object('latest_similarity', $4),
+                          || jsonb_build_object('latest_similarity', $4, 'latest_similarity_at', $6::timestamptz),
                computed_at = CURRENT_TIMESTAMP,
                expires_at = CURRENT_TIMESTAMP + INTERVAL '30 days',
                projection_run_id = $5,
@@ -118,14 +132,14 @@ pub const UPSERT_MERGE_CANDIDATE: &str = r#"WITH refreshed AS (
            ) SELECT
              $1, $2, $3, $4,
              CURRENT_TIMESTAMP, 'pending',
-             jsonb_build_object('source', 'similarity_pairs', 'latest_similarity', $4),
+             jsonb_build_object('source', 'similarity_pairs', 'latest_similarity', $4, 'latest_similarity_at', $6::timestamptz),
              (CURRENT_TIMESTAMP + (30) * INTERVAL '1 day'), $5
            WHERE NOT EXISTS (SELECT 1 FROM refreshed)
            ON CONFLICT (mac_a, mac_b) DO UPDATE SET
              confidence = GREATEST(merge_candidates.confidence, EXCLUDED.confidence),
              evidence = (CASE WHEN jsonb_typeof(merge_candidates.evidence) = 'object' THEN merge_candidates.evidence
                               ELSE jsonb_build_object('legacy_evidence', merge_candidates.evidence) END)
-                        || jsonb_build_object('latest_similarity', EXCLUDED.confidence),
+                        || jsonb_build_object('latest_similarity', EXCLUDED.confidence, 'latest_similarity_at', $6::timestamptz),
              computed_at = EXCLUDED.computed_at,
              expires_at = EXCLUDED.expires_at,
              projection_run_id = EXCLUDED.projection_run_id,

@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
 
 const RETENTION_BUDGET: Duration = Duration::from_secs(240);
+const PRUNE_BUDGET: Duration = Duration::from_secs(10);
 const ARTIFACT_BATCH_SIZE: usize = 100;
 
 enum ScanProgress {
@@ -141,7 +142,9 @@ const REMOVE_EXPIRED: &str = r#"
 DELETE FROM octopus_core.dq_artifacts
 WHERE artifact_id = $1 AND reference = $2 AND retained_until = '-infinity'::timestamptz"#;
 
-const PRUNE_RUNS: &str = concat!(
+macro_rules! prunable_runs {
+    ($review_guard:literal, $suffix:literal) => {
+        concat!(
     r#"
 SELECT r.run_id FROM octopus_core.dq_runs r
 WHERE r.installation_id = $1 AND r.namespace = $2
@@ -167,12 +170,23 @@ WHERE r.installation_id = $1 AND r.namespace = $2
         OR (r.projection_applied AND jsonb_typeof(r.summary->'review_candidate_ids') IS DISTINCT FROM 'array')
         OR EXISTS ("#,
     active_review!(),
+    $review_guard,
     r#"
         )
       )
-  )
-ORDER BY r.completed_at, r.run_id
-FOR UPDATE OF r SKIP LOCKED LIMIT 100"#
+  )"#,
+            $suffix
+        )
+    };
+}
+
+const PRUNE_RUNS: &str = prunable_runs!(
+    "",
+    " ORDER BY r.completed_at, r.run_id FOR UPDATE OF r SKIP LOCKED LIMIT 100"
+);
+const RECHECK_PRUNE_RUN: &str = prunable_runs!(
+    " OR ids.candidate_id <> ALL($4::text[])",
+    " AND r.run_id = $3"
 );
 
 impl DqStore {
@@ -193,13 +207,31 @@ impl DqStore {
         deadline: Instant,
     ) -> Result<(u64, ScanProgress)> {
         let mut changed = 0;
-        let more_artifacts = timeout_at(
-            deadline,
-            self.retention_page(artifacts, config, deadline, &mut changed),
+        let mut deletion_failed = false;
+        // Keep time for database-only cleanup even when object storage stalls.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let artifact_deadline = deadline - PRUNE_BUDGET.min(remaining / 4);
+        let progress = timeout_at(
+            artifact_deadline,
+            self.retention_page(
+                artifacts,
+                config,
+                artifact_deadline,
+                &mut changed,
+                &mut deletion_failed,
+            ),
         )
         .await
         .unwrap_or(Ok(ScanProgress::End))?;
-        Ok((changed, more_artifacts))
+        if Instant::now() < deadline {
+            changed += timeout_at(deadline, self.prune_retention())
+                .await
+                .unwrap_or(Ok(0))?;
+        }
+        if deletion_failed {
+            return Err(error(503, "retention_dependency_failure"));
+        }
+        Ok((changed, progress))
     }
 
     async fn retention_page(
@@ -208,6 +240,7 @@ impl DqStore {
         config: &DqConfig,
         deadline: Instant,
         changed: &mut u64,
+        deletion_failed: &mut bool,
     ) -> Result<ScanProgress> {
         if Instant::now() >= deadline {
             return Ok(ScanProgress::End);
@@ -252,7 +285,6 @@ impl DqStore {
 
         let expired = format!("{EXPIRED} FOR UPDATE OF a SKIP LOCKED");
         let claim_expired = format!("WITH expired AS ({expired}) {MARK_EXPIRED}");
-        let mut deletion_failed = false;
         let mut tx = self.transaction().await?;
         let cursor_time = cursor.as_ref().map(|(time, _)| time);
         let cursor_id = cursor.as_ref().map(|(_, id)| id);
@@ -300,7 +332,7 @@ impl DqStore {
                 .await?
             {
                 Some(count) => *changed += count,
-                None => deletion_failed = true,
+                None => *deletion_failed = true,
             }
         }
 
@@ -327,6 +359,21 @@ impl DqStore {
             .await
             .map_err(database)?;
         }
+        tx.commit().await.map_err(database)?;
+        if more_artifacts {
+            Ok(ScanProgress::Continue)
+        } else if checkpoint.is_some() {
+            Ok(ScanProgress::Wrapped)
+        } else {
+            Ok(ScanProgress::End)
+        }
+    }
+
+    async fn prune_retention(&self) -> Result<u64> {
+        let mut tx = self.transaction().await?;
+        tx.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", &[])
+            .await
+            .map_err(database)?;
         let mut pruned = 0;
         let runs = tx
             .query(
@@ -337,6 +384,30 @@ impl DqStore {
             .map_err(database)?;
         for run in runs {
             let run: String = run.get(0);
+            let candidates: Vec<String> = tx
+                .query(LOCK_REVIEW_CANDIDATES, &[&run])
+                .await
+                .map_err(database)?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            // A review can reopen while its candidate lock is held by a writer.
+            if tx
+                .query(
+                    RECHECK_PRUNE_RUN,
+                    &[
+                        &self.settings.installation_id,
+                        &self.settings.namespace,
+                        &run,
+                        &candidates,
+                    ],
+                )
+                .await
+                .map_err(database)?
+                .is_empty()
+            {
+                continue;
+            }
             tx.execute(
                 "DELETE FROM octopus_core.dq_attempts WHERE run_id=$1",
                 &[&run],
@@ -355,16 +426,7 @@ impl DqStore {
             "DELETE FROM octopus_core.dq_workers WHERE worker_instance_id IN(SELECT w.worker_instance_id FROM octopus_core.dq_workers w WHERE w.installation_id=$1 AND w.namespace=$2 AND w.last_seen_at<CURRENT_TIMESTAMP-INTERVAL '1 day' AND NOT EXISTS(SELECT 1 FROM octopus_core.dq_attempts a WHERE a.worker_instance_id=w.worker_instance_id AND a.status IN('reserved','accepted','running','applying')) LIMIT 1000)",
         ]{pruned+=tx.execute(sql,&[&self.settings.installation_id,&self.settings.namespace]).await.map_err(database)?;}
         tx.commit().await.map_err(database)?;
-        *changed += pruned;
-        if deletion_failed {
-            Err(error(503, "retention_dependency_failure"))
-        } else if more_artifacts {
-            Ok(ScanProgress::Continue)
-        } else if checkpoint.is_some() {
-            Ok(ScanProgress::Wrapped)
-        } else {
-            Ok(ScanProgress::End)
-        }
+        Ok(pruned)
     }
 
     async fn collect_artifact(

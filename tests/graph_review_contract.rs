@@ -210,8 +210,8 @@ async fn candidate_edges_prioritize_changes_and_share_confirmation_threshold() {
          DELETE FROM atheros_search.graph_edges WHERE source_node_id = 'device:06:00:00:00:00:01'
            AND edge_kind IN ('roaming','same_channel','vendor_link')",
     );
-    // A complete scan at one pair per page visits all 15 radio-device pairs.
-    for _ in 0..15 {
+    // Three qualifying pairs fit into three one-pair pages.
+    for _ in 0..3 {
         store.project_infrastructure_graph(1).await.unwrap();
     }
     assert_query(
@@ -229,12 +229,11 @@ async fn candidate_edges_prioritize_changes_and_share_confirmation_threshold() {
     )
     .await;
 
-    // Hold the graph between its initial cleanup and the same-device upsert.
+    // Hold the graph after the same-device upsert and before final cleanup.
     let mut blocker = fixture.runtime.begin_worker().await.unwrap();
     let blocker_pid = blocker
         .query(
-            "SELECT pg_backend_pid() FROM atheros_search.graph_nodes
-             WHERE node_id = 'device:04:00:00:00:00:01' FOR UPDATE",
+            "SELECT pg_backend_pid(), pg_advisory_xact_lock(hashtextextended('octopus-wireless-radio',0)) IS NULL",
             &[],
         )
         .await
@@ -554,6 +553,48 @@ async fn signal_count_mismatches_remain_partial_until_each_bucket_is_repaired() 
         &fixture,
         "SELECT coverage_status='complete' AND projection_watermark_at=source_watermark_at
          FROM atheros_search.investigation_watermarks WHERE projection_name='wireless_evidence'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn signal_summary_repairs_share_capacity_with_new_buckets() {
+    let Some(fixture) = Fixture::start().await else {
+        return;
+    };
+    let store = ProjectionStore::new(fixture.runtime.clone());
+    fixture.admin(
+        "INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,bssid,observed_at)
+         SELECT 'old-' || i, '02:00:00:00:00:01', '12:00:00:00:00:01',
+                date_trunc('hour', CURRENT_TIMESTAMP) - i * INTERVAL '5 minutes'
+         FROM generate_series(1, 3) i",
+    );
+    store.project_infrastructure_graph(10).await.unwrap();
+    fixture.admin(
+        "UPDATE atheros_search.wireless_signal_summaries SET frame_count=99;
+         INSERT INTO octopus_core.wireless_frames(dedupe_key,source_mac,bssid,observed_at)
+         SELECT 'new-' || i, '02:00:00:00:00:02', '12:00:00:00:00:01',
+                date_trunc('hour', CURRENT_TIMESTAMP) - i * INTERVAL '5 minutes'
+         FROM generate_series(1, 3) i",
+    );
+    store.project_infrastructure_graph(2).await.unwrap();
+    let progress =
+        "SELECT count(*) FILTER (WHERE source_mac='02:00:00:00:00:01' AND frame_count=1),
+                           count(*) FILTER (WHERE source_mac='02:00:00:00:00:02')
+                    FROM atheros_search.wireless_signal_summaries";
+    for (expected_repairs, expected_new) in [(1, 1), (2, 1), (2, 2)] {
+        let mut tx = fixture.runtime.begin_worker().await.unwrap();
+        let rows = tx.query(progress, &[]).await.unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), expected_repairs);
+        assert_eq!(rows[0].get::<_, i64>(1), expected_new);
+        tx.commit().await.unwrap();
+        store.project_infrastructure_graph(1).await.unwrap();
+    }
+    store.project_infrastructure_graph(2).await.unwrap();
+    assert_query(
+        &fixture,
+        "SELECT count(*) = 6 AND bool_and(frame_count = 1)
+         FROM atheros_search.wireless_signal_summaries",
     )
     .await;
 }

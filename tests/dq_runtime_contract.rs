@@ -489,7 +489,7 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
     use std::{
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         time::Duration,
     };
@@ -671,9 +671,13 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
 
     let deleted = Arc::new(AtomicUsize::new(0));
     let calls = deleted.clone();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let received = requests.clone();
     let app = Router::new().fallback_service(delete(move |uri: axum::http::Uri| {
         let calls = calls.clone();
+        let received = received.clone();
         async move {
+            received.lock().unwrap().push(uri.clone());
             if uri.query() == Some("versionId=version-3") {
                 return (StatusCode::NO_CONTENT, "");
             }
@@ -698,6 +702,20 @@ async fn interrupted_retention_hides_and_retries_the_deleted_version() {
             "retention_dependency_failure",
         );
         assert_eq!(deleted.load(Ordering::Relaxed), calls);
+        if calls == 1 {
+            let path = format!(
+                "/{}",
+                later["uri"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("s3://")
+                    .unwrap()
+            );
+            let requests = requests.lock().unwrap();
+            let later_requests: Vec<_> = requests.iter().filter(|uri| uri.path() == path).collect();
+            assert_eq!(later_requests.len(), 1);
+            assert_eq!(later_requests[0].query(), Some("versionId=version-3"));
+        }
         let mut tx = fixture.runtime.begin_worker().await.unwrap();
         let row = &tx
             .query(
@@ -941,8 +959,68 @@ async fn retention_keeps_terminal_runs_that_share_open_review_evidence() {
     .await
     .unwrap();
     tx.commit().await.unwrap();
+
+    let mut review = fixture.runtime.begin_worker().await.unwrap();
+    let pid: i32 = review.query("SELECT pg_backend_pid()", &[]).await.unwrap()[0].get(0);
+    review
+        .execute(
+            "UPDATE merge_candidates SET status='pending', updated_at=CURRENT_TIMESTAMP
+                  WHERE candidate_id='shared-review'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let collect = {
+        let (store, artifacts, config) = (store.clone(), artifacts.clone(), config.clone());
+        tokio::spawn(async move { store.retention_batch(&artifacts, &config).await })
+    };
+    wait_for_retention_review_lock(&fixture, pid).await;
+    review.commit().await.unwrap();
+    assert_eq!(join_retention(collect).await.unwrap(), 0);
+    assert!(store.get_run(&principal, holder).await.is_ok());
+
+    fixture.admin(
+        "UPDATE atheros_search.merge_candidates
+                   SET status='confirmed', updated_at=CURRENT_TIMESTAMP - INTERVAL '91 days'
+                   WHERE candidate_id='shared-review'",
+    );
     assert_eq!(store.retention_batch(&artifacts, &config).await.unwrap(), 1);
     code(store.get_run(&principal, holder).await, "run_not_found");
+}
+
+async fn wait_for_retention_review_lock(fixture: &support::Fixture, pid: i32) {
+    use std::time::Duration;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut observer = fixture.runtime.begin_worker().await.unwrap();
+            let blocked: bool = observer
+                .query(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY (pg_blocking_pids(pid)))",
+                    &[&pid],
+                )
+                .await
+                .unwrap()[0]
+                .get(0);
+            observer.commit().await.unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("collector must wait for the review lock");
+}
+
+async fn join_retention<T>(mut collect: tokio::task::JoinHandle<T>) -> T {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), &mut collect).await {
+        Ok(result) => result.unwrap(),
+        Err(_) => {
+            collect.abort();
+            panic!("collector did not finish after the review committed");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1055,28 +1133,9 @@ async fn retention_rechecks_eligibility_after_a_concurrent_review_reopens() {
         let store = store.clone();
         tokio::spawn(async move { store.collect_retention(&artifacts, &config).await })
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let mut observer = fixture.runtime.begin_worker().await.unwrap();
-            let blocked: bool = observer
-                .query(
-                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY (pg_blocking_pids(pid)))",
-                    &[&pid],
-                )
-                .await
-                .unwrap()[0]
-                .get(0);
-            observer.commit().await.unwrap();
-            if blocked {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("collector must wait for the review before claiming the artifact");
+    wait_for_retention_review_lock(&fixture, pid).await;
     review.commit().await.unwrap();
-    collect.await.unwrap().unwrap();
+    join_retention(collect).await.unwrap();
     assert_eq!(
         store.artifact(&principal, artifact, false).await.unwrap(),
         input,

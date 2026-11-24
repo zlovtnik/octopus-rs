@@ -1,7 +1,9 @@
 mod support;
 use octopus::{dispatch::DispatchStore, domain::SyncLoad};
 
-#[tokio::test]
+// The fixture's synchronous admin calls must allow the connection driver to
+// close evicted transactions while PostgreSQL waits for their locks to clear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claims_are_exclusive_fenced_and_recovered_without_losing_destination() {
     let Some(f) = support::Fixture::start().await else {
         return;

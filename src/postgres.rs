@@ -1,6 +1,9 @@
 //! PostgreSQL resource and transaction boundaries; this module never applies DDL.
 
-use crate::config::PostgresConfig;
+use crate::{
+    config::PostgresConfig,
+    domain::{BrokerRecordMetadata, IngestionDisposition},
+};
 use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod};
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use postgres_openssl::MakeTlsConnector;
@@ -407,7 +410,60 @@ pub struct PgTransaction {
     failed: bool,
 }
 
+pub(crate) enum BrokerEvidenceError {
+    Database(PgError),
+    Conflict,
+    Missing,
+}
+
+impl From<PgError> for BrokerEvidenceError {
+    fn from(error: PgError) -> Self {
+        Self::Database(error)
+    }
+}
+
 impl PgTransaction {
+    /// Check topic, partition, offset and group without making a replay decision.
+    pub(crate) async fn check_broker_evidence(
+        &mut self,
+        record: &BrokerRecordMetadata,
+        dedupe_key: &str,
+    ) -> Result<bool, BrokerEvidenceError> {
+        let rows = self.query("SELECT payload_sha256,dedupe_key FROM ingestion_evidence WHERE topic=$1 AND partition_id=$2 AND record_offset=$3 AND group_id=$4",
+            &[&record.topic,&record.partition,&record.offset,&record.consumer_group]).await?;
+        match rows.first() {
+            None => Ok(false),
+            Some(row)
+                if row.get::<_, String>(0) == record.payload_sha256
+                    && row.get::<_, String>(1) == dedupe_key =>
+            {
+                Ok(true)
+            }
+            Some(_) => Err(BrokerEvidenceError::Conflict),
+        }
+    }
+
+    pub(crate) async fn record_broker_evidence(
+        &mut self,
+        record: &BrokerRecordMetadata,
+        dedupe_key: &str,
+        disposition: IngestionDisposition,
+    ) -> Result<(), BrokerEvidenceError> {
+        // The legacy schema stores the validated group version as text.
+        let version = record.group_version.to_string();
+        self.execute("INSERT INTO ingestion_evidence(topic,partition_id,record_offset,group_id,group_version,artifact_sha256,message_key,payload_sha256,disposition,dedupe_key,first_seen_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT ON CONSTRAINT ingestion_evidence_pkey DO UPDATE SET updated_at=CURRENT_TIMESTAMP",
+            &[&record.topic,&record.partition,&record.offset,&record.consumer_group,&version,&record.artifact_sha256,&record.message_key,&record.payload_sha256,&disposition.database_value(),&dedupe_key]).await?;
+        // Recheck the winner after the upsert serializes competing writers.
+        if !self.check_broker_evidence(record, dedupe_key).await? {
+            return Err(BrokerEvidenceError::Missing);
+        }
+        // Diagnostic only. Consumers resume from the broker's committed offset.
+        let next_offset = record.offset.wrapping_add(1);
+        self.execute("INSERT INTO consumer_offsets(group_id,topic,partition_id,next_offset,group_version,artifact_sha256,updated_at) VALUES($1,$2,$3,$4,$5,$6,CURRENT_TIMESTAMP) ON CONFLICT(group_id,topic,partition_id) DO UPDATE SET next_offset=GREATEST(consumer_offsets.next_offset,EXCLUDED.next_offset),group_version=CASE WHEN EXCLUDED.next_offset>consumer_offsets.next_offset THEN EXCLUDED.group_version ELSE consumer_offsets.group_version END,artifact_sha256=CASE WHEN EXCLUDED.next_offset>consumer_offsets.next_offset THEN EXCLUDED.artifact_sha256 ELSE consumer_offsets.artifact_sha256 END,updated_at=CURRENT_TIMESTAMP",
+            &[&record.consumer_group,&record.topic,&record.partition,&next_offset,&version,&record.artifact_sha256]).await?;
+        Ok(())
+    }
+
     fn client(&self) -> Result<&Object, PgError> {
         self.client.as_ref().ok_or(PgError::Finished)
     }
@@ -510,6 +566,28 @@ impl PgTransaction {
         self.finished = true;
         Ok(())
     }
+}
+
+/// Retry completed transaction attempts with the intake and result backoff.
+pub(crate) async fn retry_broker_transaction<T, E, F>(
+    mut operation: impl FnMut() -> F,
+    retryable: impl Fn(&E) -> bool,
+) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    for attempt in 0..4 {
+        // The operation owns its transaction and permit, which drop before sleeping.
+        let result = operation().await;
+        if !result.as_ref().err().is_some_and(&retryable) {
+            return result;
+        }
+        let base = 25 << attempt;
+        let bytes = uuid::Uuid::new_v4().into_bytes();
+        let jitter = u64::from_le_bytes(bytes[..8].try_into().expect("UUID length")) % base;
+        tokio::time::sleep(Duration::from_millis(base + jitter)).await;
+    }
+    operation().await
 }
 
 impl Drop for PgTransaction {
@@ -754,6 +832,29 @@ mod tests {
             .get(0);
         assert_ne!(replacement_pid, active_pid);
         transaction.commit().await.unwrap();
+        let mut first_attempt = Some(runtime.begin_worker().await.unwrap());
+        assert_eq!(runtime.workers.available_permits(), 0);
+        {
+            let retry = retry_broker_transaction(
+                || {
+                    let transaction = first_attempt
+                        .take()
+                        .expect("only the first attempt is polled");
+                    async move {
+                        let _transaction = transaction;
+                        Err::<(), _>(PgError::Deadline)
+                    }
+                },
+                |error| matches!(error, PgError::Deadline),
+            );
+            tokio::pin!(retry);
+            assert!(futures_util::poll!(&mut retry).is_pending());
+            assert_eq!(
+                runtime.workers.available_permits(),
+                1,
+                "the backoff must not retain the worker permit"
+            );
+        }
         assert!(runtime.health_check().await);
         runtime.close();
     }

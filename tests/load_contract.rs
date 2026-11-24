@@ -219,6 +219,41 @@ async fn thirteen_sinks_authorization_replay_atomicity_and_result_fences() {
 }
 
 #[test]
+fn inline_payload_preserves_url_safe_base64_and_lossy_utf8() {
+    use octopus::load::{resolve_local_payload, LoadError};
+    use std::path::Path;
+
+    for (encoded, expected) in [
+        ("", ""),
+        ("Zg", "f"),
+        ("Zg=", "f"),
+        ("Zg==", "f"),
+        ("Zh", "f"),
+        ("Zih", "f("),
+        ("-_8", "��"),
+        ("8J-YgA", "😀"),
+    ] {
+        let reference = format!("inline://json/{encoded}");
+        assert_eq!(
+            resolve_local_payload(&reference, Path::new(".")).unwrap(),
+            expected,
+            "{encoded:?}"
+        );
+    }
+
+    for encoded in ["A", "A==", "=A", "AAAA=", "Zg===", "+/8", "Zg\n", "Zé"] {
+        let reference = format!("inline://json/{encoded}");
+        assert!(
+            matches!(
+                resolve_local_payload(&reference, Path::new(".")),
+                Err(LoadError::Invalid("invalid inline payload encoding"))
+            ),
+            "{encoded:?}"
+        );
+    }
+}
+
+#[test]
 fn local_payload_paths_and_encoding() {
     use octopus::load::{resolve_local_payload, LoadError};
     let dir = tempfile::tempdir().unwrap();

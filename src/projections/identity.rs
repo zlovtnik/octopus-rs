@@ -6,6 +6,8 @@ use crate::postgres::PgTransaction;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 
+pub(super) const AUTOMATIC_MERGE_SIMILARITY: f64 = 0.98;
+
 const RECONCILE_PREDICATE:&str="CASE WHEN $1::text[] IS NULL THEN NOT EXISTS (SELECT 1 FROM octopus_core.dq_scope_policies policy WHERE policy.mode='enabled' AND (policy.authorized_scope='*' OR (EXISTS (SELECT 1 FROM atheros_search.devices device WHERE device.mac=candidate.mac_a AND device.location_id=policy.authorized_scope) AND EXISTS (SELECT 1 FROM atheros_search.devices device WHERE device.mac=candidate.mac_b AND device.location_id=policy.authorized_scope)))) ELSE candidate.candidate_id=ANY($1::text[]) END";
 
 pub async fn persist_merge_candidate(
@@ -24,12 +26,13 @@ pub async fn persist_merge_candidate(
     };
     let id = stable_id("merge-candidate", &[left, right]);
     let run = stable_id("merge-candidate-run", &[&id]);
-    tx.execute(
-        q::PERSIST_MERGE_CANDIDATE_0,
-        &[&id, &left, &right, &confidence.clamp(0.0, 1.0), &run],
-    )
-    .await?;
-    Ok(id)
+    let rows = tx
+        .query(
+            q::UPSERT_MERGE_CANDIDATE,
+            &[&id, &left, &right, &confidence.clamp(0.0, 1.0), &run],
+        )
+        .await?;
+    Ok(rows[0].get(0))
 }
 async fn reconcile(
     tx: &mut PgTransaction,
@@ -53,7 +56,9 @@ async fn reconcile(
         updated_at=CURRENT_TIMESTAMP FROM classified WHERE classified.candidate_id=candidate.candidate_id
         AND (candidate.status,candidate.confirmation_source,candidate.trusted_registered_device_id)
         IS DISTINCT FROM (classified.next_status,classified.next_source,classified.next_registered_device_id)");
-    Ok(tx.execute(&statement, &[&ids, &0.98_f64]).await? as i32)
+    Ok(tx
+        .execute(&statement, &[&ids, &AUTOMATIC_MERGE_SIMILARITY])
+        .await? as i32)
 }
 pub async fn reconcile_merge_confirmations_for(
     tx: &mut PgTransaction,
@@ -76,7 +81,10 @@ pub async fn reconcile_merge_confirmations_for(
 }
 pub async fn replace_approved_clusters(tx: &mut PgTransaction) -> Result<i32, ProjectionError> {
     let edges = tx
-        .query(q::APPROVED_IDENTITY_EDGES_0, &[&0.98_f64])
+        .query(
+            q::SELECT_APPROVED_IDENTITY_EDGES,
+            &[&AUTOMATIC_MERGE_SIMILARITY],
+        )
         .await?
         .into_iter()
         .map(|r| (r.get(0), r.get(1), r.get(2)))
@@ -142,7 +150,7 @@ impl ProjectionStore {
         let mut tx = self.runtime.begin_worker().await?;
         let edges = tx
             .query(
-                q::SIMILARITY_EDGES_0,
+                q::SELECT_SIMILARITY_EDGES,
                 &[&minimum_similarity.clamp(-1.0, 1.0), &limit.max(1)],
             )
             .await?;

@@ -1,8 +1,8 @@
 # Octopus Rust migration
 
-> **Status: G3 candidate validation in progress.** Scala owns the running
-> coordinator. The [native assembly](src/application/workloads.rs) supports the
-> broker-drain profile. Enabling a processor without native wiring fails startup.
+> **Status: Native Octopus runs in local Compose.** Production still uses Scala.
+> The [native assembly](src/application/workloads.rs) supports the sync profile.
+> Enabling a processor without native wiring fails startup.
 
 ## Local development and native candidate validation
 
@@ -13,7 +13,7 @@ provenance checks require a clean parent commit pinning this Rust submodule.
 | --- | --- |
 | Parent Jenkins | Enable `RUN_OCTOPUS_NATIVE` to run native coverage, the release build and image checks alongside Scala. |
 | Standalone Jenkins | Enable `RUN_NATIVE` and supply the pinning parent SHA in `PARENT_REVISION` for the canonical schema and executor fixtures. |
-| Local runtime Compose | `docker compose -f docker-compose.yaml -f docker-compose.octopus-native.yaml up --build octopus` |
+| Local runtime Compose | `make local-up` builds the stack and verifies that Octopus PID 1 is `/app/octopus`. `make local-check` verifies schema readiness, Search, and native scan evidence and broker commit. |
 | Build-only Compose | `OCTOPUS_BUILD_DOCKERFILE=services/octopus-rs/templates/Dockerfile docker compose -f docker-compose.build.yaml build java-coordinator` |
 | Image contract | `make octopus-native-image-check` builds linux/amd64 and verifies both OCI revision labels, the ELF entrypoint and configuration behavior. |
 | DQ acceptance | In the [DQ test environment](../dq/tests/acceptance.md), run `python3 services/dq/tests/acceptance/run.py --octopus-native`. |
@@ -74,10 +74,13 @@ is available in both checkout layouts as described above.
 
 ## Native build contract
 
-The active [Cargo.toml](Cargo.toml) defines an independent library workspace with
+The active [Cargo.toml](Cargo.toml) defines an independent Rust workspace with
 its own [Cargo.lock](Cargo.lock). Its `[workspace]` prevents Cargo from selecting
 the parent proxy workspace. [src/lib.rs](src/lib.rs) exposes implemented library
-slices. The coordinator binary target is `octopus`.
+slices. The [coordinator entrypoint](src/main.rs) builds as `octopus`. It loads
+defaults, environment settings, HOCON from `-Dconfig.file` and explicit
+`-Dkey=value` overrides in that order. Password-file resolution and validation
+run before runtime startup.
 
 [rust-toolchain.toml](rust-toolchain.toml) pins Rust
 1.100.0 and includes rustfmt, Clippy and matching LLVM tools. The active

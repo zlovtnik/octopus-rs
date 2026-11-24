@@ -71,8 +71,9 @@ impl DispatchStore {
     pub async fn ensure_cursors(&self, streams: &[String]) -> Result<(), LoadError> {
         let mut tx = self.runtime.begin_worker().await?;
         for stream in streams {
-            if crate::util::java_trim(stream) == "wireless.audit" {
-                tx.execute("INSERT INTO sync_cursors(stream_name,cursor_value,updated_at) VALUES($1,'0',CURRENT_TIMESTAMP) ON CONFLICT(stream_name) DO NOTHING",&[stream]).await?;
+            let stream = crate::util::java_trim(stream);
+            if stream == "wireless.audit" {
+                tx.execute("INSERT INTO sync_cursors(stream_name,cursor_value,updated_at) VALUES($1,'0',CURRENT_TIMESTAMP) ON CONFLICT(stream_name) DO NOTHING",&[&stream]).await?;
             }
         }
         tx.commit().await?;
@@ -142,6 +143,8 @@ impl DispatchStore {
         Ok(changed)
     }
 
+    /// Drain previously admitted batches for supported sinks, including batches
+    /// whose stream was removed from the current intake and planning policy.
     pub async fn enqueue_pending(&self, limit: i64, max_attempts: i32) -> Result<u64, LoadError> {
         let streams = crate::load::SinkTarget::STREAMS
             .iter()

@@ -330,7 +330,8 @@ impl DqStore {
         let mut tx = self.transaction().await?;
         let rows = tx
             .query(
-                "SELECT run_id,reference FROM octopus_core.dq_artifacts WHERE artifact_id=$1",
+                "SELECT run_id,reference FROM octopus_core.dq_artifacts
+                 WHERE artifact_id=$1 AND retained_until IS DISTINCT FROM '-infinity'::timestamptz",
                 &[&artifact],
             )
             .await

@@ -50,7 +50,15 @@ impl ProjectionStore {
         value: Value,
         metadata: &BrokerRecordMetadata,
     ) -> Result<bool, ProjectionError> {
-        let event = WirelessObservation::from_value(&value)?;
+        self.project_wireless_observation(WirelessObservation::from_value(&value)?, metadata)
+            .await
+    }
+
+    pub async fn project_wireless_observation(
+        &self,
+        event: WirelessObservation,
+        metadata: &BrokerRecordMetadata,
+    ) -> Result<bool, ProjectionError> {
         let mut tx = self.runtime.begin_worker().await?;
         let projected = wireless::project(&mut tx, &event, metadata, &self.wireless).await?;
         tx.commit().await?;

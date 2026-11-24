@@ -29,96 +29,69 @@ pub enum ProcessorMode {
     #[serde(rename = "periodic")]
     Periodic,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub enum ProcessorId {
-    #[serde(rename = "sync-scan-ingestion")]
-    SyncScanIngestion,
-    #[serde(rename = "sync-job-planner")]
-    SyncJobPlanner,
-    #[serde(rename = "sync-backlog-recovery")]
-    SyncBacklogRecovery,
-    #[serde(rename = "sync-load-dispatch")]
-    SyncLoadDispatch,
-    #[serde(rename = "sync-load-consumer")]
-    SyncLoadConsumer,
-    #[serde(rename = "sync-result-consumer")]
-    SyncResultConsumer,
-    #[serde(rename = "sync-outbox-publisher")]
-    SyncOutboxPublisher,
-    #[serde(rename = "wireless-heartbeat-ingestion")]
-    WirelessHeartbeatIngestion,
-    #[serde(rename = "wireless-audit-projection")]
-    WirelessAuditProjection,
-    #[serde(rename = "wireless-frame-normalizer")]
-    WirelessFrameNormalizer,
-    #[serde(rename = "wireless-inventory-projector")]
-    WirelessInventoryProjector,
-    #[serde(rename = "wireless-identity-projector")]
-    WirelessIdentityProjector,
-    #[serde(rename = "wireless-behavior-projector")]
-    WirelessBehaviorProjector,
-    #[serde(rename = "wireless-timing-projector")]
-    WirelessTimingProjector,
-    #[serde(rename = "wireless-sequence-projector")]
-    WirelessSequenceProjector,
-    #[serde(rename = "wireless-baseline-projector")]
-    WirelessBaselineProjector,
-    #[serde(rename = "wireless-similarity-projector")]
-    WirelessSimilarityProjector,
-    #[serde(rename = "threat-risk-projector")]
-    ThreatRiskProjector,
-    #[serde(rename = "embedding-preparer")]
-    EmbeddingPreparer,
-    #[serde(rename = "embedding-completer")]
-    EmbeddingCompleter,
-    #[serde(rename = "embedding-lease-recovery")]
-    EmbeddingLeaseRecovery,
-    #[serde(rename = "embedding-text-builder")]
-    EmbeddingTextBuilder,
-    #[serde(rename = "proxy-search-preparer")]
-    ProxySearchPreparer,
-    #[serde(rename = "rf-alert-projector")]
-    RfAlertProjector,
-    #[serde(rename = "event-retention")]
-    EventRetention,
-    #[serde(rename = "search-retention")]
-    SearchRetention,
-    #[serde(rename = "stale-worker-cleanup")]
-    StaleWorkerCleanup,
-    #[serde(rename = "scheduled-reconciliation")]
-    ScheduledReconciliation,
+// Keep declaration order (and thus Ord and serde variant indices) stable.
+macro_rules! processor_ids {
+    ($($id:ident => $name:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        pub enum ProcessorId {
+            $(#[serde(rename = $name)] $id,)+
+        }
+
+        impl ProcessorId {
+            const COUNT: usize = [$(Self::$id),+].len();
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$id => $name,)+
+                }
+            }
+        }
+    };
 }
+
+processor_ids! {
+    SyncScanIngestion => "sync-scan-ingestion",
+    SyncJobPlanner => "sync-job-planner",
+    SyncBacklogRecovery => "sync-backlog-recovery",
+    SyncLoadDispatch => "sync-load-dispatch",
+    SyncLoadConsumer => "sync-load-consumer",
+    SyncResultConsumer => "sync-result-consumer",
+    SyncOutboxPublisher => "sync-outbox-publisher",
+    WirelessHeartbeatIngestion => "wireless-heartbeat-ingestion",
+    WirelessAuditProjection => "wireless-audit-projection",
+    WirelessFrameNormalizer => "wireless-frame-normalizer",
+    WirelessInventoryProjector => "wireless-inventory-projector",
+    WirelessIdentityProjector => "wireless-identity-projector",
+    WirelessBehaviorProjector => "wireless-behavior-projector",
+    WirelessTimingProjector => "wireless-timing-projector",
+    WirelessSequenceProjector => "wireless-sequence-projector",
+    WirelessBaselineProjector => "wireless-baseline-projector",
+    WirelessSimilarityProjector => "wireless-similarity-projector",
+    ThreatRiskProjector => "threat-risk-projector",
+    EmbeddingPreparer => "embedding-preparer",
+    EmbeddingCompleter => "embedding-completer",
+    EmbeddingLeaseRecovery => "embedding-lease-recovery",
+    EmbeddingTextBuilder => "embedding-text-builder",
+    ProxySearchPreparer => "proxy-search-preparer",
+    RfAlertProjector => "rf-alert-projector",
+    EventRetention => "event-retention",
+    SearchRetention => "search-retention",
+    StaleWorkerCleanup => "stale-worker-cleanup",
+    ScheduledReconciliation => "scheduled-reconciliation",
+}
+
 impl ProcessorId {
-    pub const ALL: [Self; 28] = [
-        Self::WirelessAuditProjection,
-        Self::SyncScanIngestion,
-        Self::SyncJobPlanner,
-        Self::SyncBacklogRecovery,
-        Self::SyncLoadDispatch,
-        Self::SyncLoadConsumer,
-        Self::SyncResultConsumer,
-        Self::SyncOutboxPublisher,
-        Self::WirelessHeartbeatIngestion,
-        Self::WirelessFrameNormalizer,
-        Self::WirelessInventoryProjector,
-        Self::WirelessIdentityProjector,
-        Self::WirelessBehaviorProjector,
-        Self::WirelessTimingProjector,
-        Self::WirelessSequenceProjector,
-        Self::WirelessBaselineProjector,
-        Self::WirelessSimilarityProjector,
-        Self::ThreatRiskProjector,
-        Self::EmbeddingPreparer,
-        Self::EmbeddingCompleter,
-        Self::EmbeddingLeaseRecovery,
-        Self::EmbeddingTextBuilder,
-        Self::ProxySearchPreparer,
-        Self::RfAlertProjector,
-        Self::EventRetention,
-        Self::SearchRetention,
-        Self::StaleWorkerCleanup,
-        Self::ScheduledReconciliation,
-    ];
+    // The catalog order differs from the enum's declaration order.
+    pub const ALL: [Self; Self::COUNT] = {
+        let mut ids = [Self::SyncScanIngestion; Self::COUNT];
+        let mut index = 0;
+        while index < ids.len() {
+            ids[index] = CONTRACTS[index].id;
+            index += 1;
+        }
+        ids
+    };
+
     pub const KAFKA_CONSUMERS: [Self; 5] = [
         Self::WirelessAuditProjection,
         Self::SyncScanIngestion,
@@ -126,102 +99,14 @@ impl ProcessorId {
         Self::SyncResultConsumer,
         Self::WirelessHeartbeatIngestion,
     ];
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SyncScanIngestion => "sync-scan-ingestion",
-            Self::SyncJobPlanner => "sync-job-planner",
-            Self::SyncBacklogRecovery => "sync-backlog-recovery",
-            Self::SyncLoadDispatch => "sync-load-dispatch",
-            Self::SyncLoadConsumer => "sync-load-consumer",
-            Self::SyncResultConsumer => "sync-result-consumer",
-            Self::SyncOutboxPublisher => "sync-outbox-publisher",
-            Self::WirelessHeartbeatIngestion => "wireless-heartbeat-ingestion",
-            Self::WirelessAuditProjection => "wireless-audit-projection",
-            Self::WirelessFrameNormalizer => "wireless-frame-normalizer",
-            Self::WirelessInventoryProjector => "wireless-inventory-projector",
-            Self::WirelessIdentityProjector => "wireless-identity-projector",
-            Self::WirelessBehaviorProjector => "wireless-behavior-projector",
-            Self::WirelessTimingProjector => "wireless-timing-projector",
-            Self::WirelessSequenceProjector => "wireless-sequence-projector",
-            Self::WirelessBaselineProjector => "wireless-baseline-projector",
-            Self::WirelessSimilarityProjector => "wireless-similarity-projector",
-            Self::ThreatRiskProjector => "threat-risk-projector",
-            Self::EmbeddingPreparer => "embedding-preparer",
-            Self::EmbeddingCompleter => "embedding-completer",
-            Self::EmbeddingLeaseRecovery => "embedding-lease-recovery",
-            Self::EmbeddingTextBuilder => "embedding-text-builder",
-            Self::ProxySearchPreparer => "proxy-search-preparer",
-            Self::RfAlertProjector => "rf-alert-projector",
-            Self::EventRetention => "event-retention",
-            Self::SearchRetention => "search-retention",
-            Self::StaleWorkerCleanup => "stale-worker-cleanup",
-            Self::ScheduledReconciliation => "scheduled-reconciliation",
-        }
-    }
     pub fn owner(self) -> ProcessorOwner {
-        match self {
-            Self::SyncScanIngestion => ProcessorOwner::Octopus,
-            Self::SyncJobPlanner => ProcessorOwner::Octopus,
-            Self::SyncBacklogRecovery => ProcessorOwner::Octopus,
-            Self::SyncLoadDispatch => ProcessorOwner::Octopus,
-            Self::SyncLoadConsumer => ProcessorOwner::Octopus,
-            Self::SyncResultConsumer => ProcessorOwner::Octopus,
-            Self::SyncOutboxPublisher => ProcessorOwner::Octopus,
-            Self::WirelessHeartbeatIngestion => ProcessorOwner::Octopus,
-            Self::WirelessAuditProjection => ProcessorOwner::Octopus,
-            Self::WirelessFrameNormalizer => ProcessorOwner::Octopus,
-            Self::WirelessInventoryProjector => ProcessorOwner::Octopus,
-            Self::WirelessIdentityProjector => ProcessorOwner::Octopus,
-            Self::WirelessBehaviorProjector => ProcessorOwner::Octopus,
-            Self::WirelessTimingProjector => ProcessorOwner::Octopus,
-            Self::WirelessSequenceProjector => ProcessorOwner::Octopus,
-            Self::WirelessBaselineProjector => ProcessorOwner::Octopus,
-            Self::WirelessSimilarityProjector => ProcessorOwner::Octopus,
-            Self::ThreatRiskProjector => ProcessorOwner::Octopus,
-            Self::EmbeddingPreparer => ProcessorOwner::Octopus,
-            Self::EmbeddingCompleter => ProcessorOwner::AtherosSearch,
-            Self::EmbeddingLeaseRecovery => ProcessorOwner::AtherosSearch,
-            Self::EmbeddingTextBuilder => ProcessorOwner::Octopus,
-            Self::ProxySearchPreparer => ProcessorOwner::Octopus,
-            Self::RfAlertProjector => ProcessorOwner::Octopus,
-            Self::EventRetention => ProcessorOwner::Octopus,
-            Self::SearchRetention => ProcessorOwner::Octopus,
-            Self::StaleWorkerCleanup => ProcessorOwner::Octopus,
-            Self::ScheduledReconciliation => ProcessorOwner::Octopus,
-        }
+        ProcessorCatalog::by_id(self).owner
     }
+
     pub fn family(self) -> ProcessorFamily {
-        match self {
-            Self::SyncScanIngestion => ProcessorFamily::Sync,
-            Self::SyncJobPlanner => ProcessorFamily::Sync,
-            Self::SyncBacklogRecovery => ProcessorFamily::Sync,
-            Self::SyncLoadDispatch => ProcessorFamily::Sync,
-            Self::SyncLoadConsumer => ProcessorFamily::Sync,
-            Self::SyncResultConsumer => ProcessorFamily::Sync,
-            Self::SyncOutboxPublisher => ProcessorFamily::Sync,
-            Self::WirelessHeartbeatIngestion => ProcessorFamily::Wireless,
-            Self::WirelessAuditProjection => ProcessorFamily::Wireless,
-            Self::WirelessFrameNormalizer => ProcessorFamily::Wireless,
-            Self::WirelessInventoryProjector => ProcessorFamily::Wireless,
-            Self::WirelessIdentityProjector => ProcessorFamily::Wireless,
-            Self::WirelessBehaviorProjector => ProcessorFamily::Wireless,
-            Self::WirelessTimingProjector => ProcessorFamily::Wireless,
-            Self::WirelessSequenceProjector => ProcessorFamily::Wireless,
-            Self::WirelessBaselineProjector => ProcessorFamily::Wireless,
-            Self::WirelessSimilarityProjector => ProcessorFamily::Wireless,
-            Self::ThreatRiskProjector => ProcessorFamily::SearchProjection,
-            Self::EmbeddingPreparer => ProcessorFamily::Embedding,
-            Self::EmbeddingCompleter => ProcessorFamily::Embedding,
-            Self::EmbeddingLeaseRecovery => ProcessorFamily::Embedding,
-            Self::EmbeddingTextBuilder => ProcessorFamily::Embedding,
-            Self::ProxySearchPreparer => ProcessorFamily::Embedding,
-            Self::RfAlertProjector => ProcessorFamily::SearchProjection,
-            Self::EventRetention => ProcessorFamily::Maintenance,
-            Self::SearchRetention => ProcessorFamily::Maintenance,
-            Self::StaleWorkerCleanup => ProcessorFamily::Maintenance,
-            Self::ScheduledReconciliation => ProcessorFamily::Maintenance,
-        }
+        ProcessorCatalog::by_id(self).family
     }
+
     pub fn from_string(value: &str) -> Result<Self, String> {
         Self::ALL
             .into_iter()
@@ -229,9 +114,10 @@ impl ProcessorId {
             .ok_or_else(|| format!("unknown or retired processor id: {value}"))
     }
     pub fn octopus_owned() -> impl Iterator<Item = Self> {
-        Self::ALL
-            .into_iter()
-            .filter(|id| id.owner() == ProcessorOwner::Octopus)
+        ProcessorCatalog::contracts()
+            .iter()
+            .filter(|contract| contract.owner == ProcessorOwner::Octopus)
+            .map(|contract| contract.id)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -261,7 +147,7 @@ impl ProcessorCatalog {
             .expect("all IDs have contracts")
     }
 }
-static CONTRACTS: [ProcessorContract; 28] = [
+static CONTRACTS: [ProcessorContract; ProcessorId::COUNT] = [
     ProcessorContract {
         id: ProcessorId::WirelessAuditProjection,
         owner: ProcessorOwner::Octopus,

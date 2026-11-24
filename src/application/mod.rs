@@ -178,20 +178,18 @@ async fn start(config: AppConfig, stop: CancellationToken, tasks: &mut JoinSet<R
         let metrics = metrics.clone();
         let shutdown = stop.clone();
         tasks.spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(config.cron.idle_sleep_ms as u64));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! { biased; _ = shutdown.cancelled() => return Ok(()), _ = interval.tick() => {} }
-                let result = tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => return Ok(()),
-                    result = backpressure.check_and_act() => result,
-                };
-                match result {
-                    Ok(pending) => metrics.sample_state(pending, backpressure.suspended()),
-                    Err(error) => tracing::warn!(error = %octopus::errors::message(&error), "backpressure sampling failed"),
-                }
-            }
+            run_interval(
+                Duration::from_millis(config.cron.idle_sleep_ms as u64),
+                shutdown,
+                || async {
+                    match backpressure.check_and_act().await {
+                        Ok(pending) => metrics.sample_state(pending, backpressure.suspended()),
+                        Err(error) => tracing::warn!(error = %octopus::errors::message(&error), "backpressure sampling failed"),
+                    }
+                },
+            )
+            .await;
+            Ok(())
         });
     }
     if config.public_stats.enabled {
@@ -214,21 +212,55 @@ async fn start(config: AppConfig, stop: CancellationToken, tasks: &mut JoinSet<R
             Ok(())
         });
         tasks.spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! { biased; _ = stop.cancelled() => return Ok(()), _ = interval.tick() => {} }
-                let result = tokio::select! {
-                    biased;
-                    _ = stop.cancelled() => return Ok(()),
-                    result = dq_store.collect_retention(&artifacts, &config.dq) => result,
-                };
-                if let Err(error) = result {
+            run_interval(Duration::from_secs(300), stop, || async {
+                if let Err(error) = dq_store.collect_retention(&artifacts, &config.dq).await {
                     tracing::warn!(error_code = %error.code, "DQ retention retry");
                 }
-            }
+            })
+            .await;
+            Ok(())
         });
     }
     tracing::info!(port = config.http.port, "Octopus started");
     Ok(())
+}
+
+async fn run_interval<F>(period: Duration, stop: CancellationToken, tick: impl Fn() -> F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => return,
+            _ = interval.tick() => {}
+        }
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => return,
+            _ = tick() => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn interval_starts_immediately_and_cancels_in_flight_tick() {
+        let stop = CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            run_interval(Duration::from_secs(60), stop.clone(), || async {
+                stop.cancel();
+                std::future::pending::<()>().await;
+            }),
+        )
+        .await
+        .expect("the first tick must run without waiting a period");
+        assert!(stop.is_cancelled());
+    }
 }

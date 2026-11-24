@@ -294,9 +294,43 @@ async fn canonical_runtime_restarts_records_cancellation_and_rejects_stale_fence
         .unwrap()
         .unwrap()
         .is_err());
-    assert!(leases
+    let released = leases
         .acquire("processor", id.as_str(), "owner-d", 60)
         .await
         .unwrap()
-        .is_some());
+        .unwrap();
+    assert!(leases
+        .release("processor", id.as_str(), &released)
+        .await
+        .unwrap());
+
+    let (started, running) = tokio::sync::oneshot::channel();
+    let runner = leases.clone();
+    let task = tokio::spawn(async move {
+        runner
+            .run_fenced(id, "lost-owner", 3, CancellationToken::new(), |_| {
+                started.send(()).unwrap();
+                Box::pin(std::future::pending::<Result<(), WorkloadError>>())
+            })
+            .await
+    });
+    running.await.unwrap();
+    fixture.admin("UPDATE octopus_core.work_leases SET lease_expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second' WHERE owner_id='lost-owner'");
+    let successor = leases
+        .acquire("processor", id.as_str(), "successor", 60)
+        .await
+        .unwrap()
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(error, WorkloadError::Retryable(message) if message == "processor lease was lost")
+    );
+    assert!(leases
+        .release("processor", id.as_str(), &successor)
+        .await
+        .unwrap());
 }

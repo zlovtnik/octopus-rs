@@ -334,7 +334,7 @@ async fn real_minio_archive_is_verified_restart_safe_and_retention_is_fenced() {
     // Search retention preserves active embedding work and deletes old terminal
     // documents together with vectors, token/tag children and terminal jobs.
     let document = "00000000-0000-0000-0000-000000000123";
-    fixture.admin(&format!("INSERT INTO atheros_search.search_documents(document_id,source_kind,source_id,normalized_text,normalized_sha256,search_vector,status,updated_at) VALUES('{document}','event','old-doc','text',repeat('a',64),to_tsvector('text'),'superseded',CURRENT_TIMESTAMP-INTERVAL '3 days'); INSERT INTO atheros_search.embedding_jobs(job_id,document_id,embedding_kind,embedding_model,content_sha256,status) VALUES('00000000-0000-0000-0000-000000000124','{document}','event','model',repeat('a',64),'pending')"));
+    fixture.admin(&format!("INSERT INTO atheros_search.search_documents(document_id,source_kind,source_id,source_key,source_table,normalized_text,normalized_sha256,search_vector,status,updated_at) VALUES('{document}','event','old-doc','old-doc','wireless_frames','text',repeat('a',64),to_tsvector('text'),'superseded',CURRENT_TIMESTAMP-INTERVAL '3 days'); INSERT INTO atheros_search.embedding_jobs(job_id,document_id,embedding_kind,embedding_model,content_sha256,status) VALUES('00000000-0000-0000-0000-000000000124','{document}','event','model',repeat('a',64),'pending')"));
     let search_lease = leases
         .acquire("maintenance", "search-retention", "owner", 30)
         .await

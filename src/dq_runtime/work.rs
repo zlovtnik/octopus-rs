@@ -18,16 +18,37 @@ impl DqStore {
     async fn artifacts_tx(&self, tx: &mut PgTransaction, run: &str, refs: &Value) -> Result<()> {
         for reference in refs.as_array().into_iter().flatten() {
             let artifact = dq::text(reference, "artifact_id")?;
-            tx.execute("INSERT INTO octopus_core.dq_artifacts(artifact_id,run_id,reference,installation_id,namespace) VALUES($1,$2,$3,$4,$5) ON CONFLICT(artifact_id) DO NOTHING",&[&artifact,&run,&reference,&self.settings.installation_id,&self.settings.namespace]).await.map_err(database)?;
-            let existing: Value = tx
+            // Both callers lock the owning run. Validated object paths are
+            // run-scoped, so that lock also serializes exact-version admission.
+            let alias_exists: bool = tx
                 .query(
-                    "SELECT reference FROM octopus_core.dq_artifacts WHERE artifact_id=$1",
-                    &[&artifact],
+                    "SELECT EXISTS (
+                       SELECT 1 FROM octopus_core.dq_artifacts
+                       WHERE reference->>'uri' = $1 AND reference->>'version_id' = $2 AND artifact_id <> $3
+                     )",
+                    &[&dq::text(reference, "uri")?, &dq::text(reference, "version_id")?, &artifact],
                 )
                 .await
                 .map_err(database)?[0]
                 .get(0);
-            if dq::canonical(&existing)? != dq::canonical(reference)? {
+            if alias_exists {
+                return Err(error(409, "artifact_identity_conflict"));
+            }
+            let accepted = tx
+                .execute(
+                    "INSERT INTO octopus_core.dq_artifacts AS existing
+                       (artifact_id,run_id,reference,installation_id,namespace)
+                     VALUES ($1,$2,$3,$4,$5)
+                     ON CONFLICT (artifact_id) DO UPDATE SET artifact_id = EXCLUDED.artifact_id
+                     WHERE existing.run_id = EXCLUDED.run_id AND existing.reference = EXCLUDED.reference
+                       AND existing.installation_id = EXCLUDED.installation_id
+                       AND existing.namespace = EXCLUDED.namespace
+                       AND existing.retained_until IS DISTINCT FROM '-infinity'::timestamptz",
+                    &[&artifact, &run, &reference, &self.settings.installation_id, &self.settings.namespace],
+                )
+                .await
+                .map_err(database)?;
+            if accepted != 1 {
                 return Err(error(409, "artifact_identity_conflict"));
             }
         }

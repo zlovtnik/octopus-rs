@@ -257,8 +257,12 @@ fn artifact_references_enforce_scope_paths_and_output_producers() {
         "s3://{}/{}/{}/",
         settings.artifact_bucket, settings.installation_id, settings.namespace
     );
-    let reference = json!({"installation_id":settings.installation_id,"namespace":settings.namespace,"artifact_id":"artifact","sha256":"a".repeat(64),"version_id":"v1","etag":"etag","size_bytes":2,"uri":format!("{prefix}inputs/object")});
+    let reference = json!({"installation_id":settings.installation_id,"namespace":settings.namespace,"artifact_id":"artifact","sha256":"a".repeat(64),"version_id":"v1","etag":"etag","size_bytes":2,"uri":format!("{prefix}inputs/run/object")});
     validate_artifacts(&json!([reference.clone()]), &settings, "run", None, true).unwrap();
+    code(
+        validate_artifacts(&json!([reference.clone()]), &settings, "other", None, true),
+        "forbidden_artifact_reference",
+    );
     let mut output = reference.clone();
     output["uri"] = json!(format!("{prefix}runs/run/attempts/attempt/object"));
     output["producer_run_id"] = json!("run");
@@ -283,7 +287,7 @@ fn artifact_references_enforce_scope_paths_and_output_producers() {
         "object@host",
     ] {
         let mut changed = reference.clone();
-        changed["uri"] = json!(format!("{prefix}inputs/{suffix}"));
+        changed["uri"] = json!(format!("{prefix}inputs/run/{suffix}"));
         code(
             validate_artifacts(&json!([changed]), &settings, "run", None, true),
             "forbidden_artifact_reference",
